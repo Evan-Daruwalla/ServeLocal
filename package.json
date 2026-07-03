@@ -1,0 +1,25 @@
+{
+  "name": "servelocal",
+  "version": "2.0.0",
+  "private": true,
+  "description": "ServeLocal — volunteer platform connecting students with community service. Free forever for students.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test",
+    "test:coverage": "node --test --experimental-test-coverage",
+    "coverage:check": "node --test --experimental-test-coverage --test-coverage-lines=50 --test-coverage-branches=70 --test-coverage-functions=30",
+    "audit": "npm audit --audit-level=high",
+    "loadtest": "node scripts/loadtest.js",
+    "chaos": "node scripts/chaos.js",
+    "backup": "node scripts/backup.js",
+    "restore": "node scripts/restore.js",
+    "lint": "node -e \"require('child_process').execSync('node --check server.js',{stdio:'inherit'})\""
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "license": "UNLICENSED"
+}

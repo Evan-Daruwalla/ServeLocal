@@ -1,0 +1,229 @@
+================================================================================
+  SERVELOCAL — DEPLOYMENT GUIDE
+================================================================================
+
+This file covers everything needed to go from localhost to a live production
+deployment. Keep it updated as new features are added that require a domain,
+API keys, or external services.
+
+
+================================================================================
+  1. GITHUB SETUP
+================================================================================
+
+  1. Create a new repo on GitHub (private recommended)
+  2. From the project root (ServeLocal website/):
+
+       git init
+       git add .
+       git commit -m "Initial commit"
+       git branch -M main
+       git remote add origin https://github.com/YOUR_USERNAME/servelocal.git
+       git push -u origin main
+
+  3. Create a .gitignore BEFORE pushing:
+
+       node_modules/
+       db.json
+       .env
+
+     db.json is your database — don't commit it to version control.
+     .env contains secrets — never push it.
+
+
+================================================================================
+  2. RAILWAY DEPLOYMENT
+================================================================================
+
+  Railway auto-detects Node.js projects and runs them with zero config.
+
+  1. Go to https://railway.app and sign in with GitHub
+  2. Click "New Project" > "Deploy from GitHub Repo"
+  3. Select your ServeLocal repo
+  4. Railway will auto-detect server.js. Set these:
+       - Root Directory:    (leave blank if repo root IS "ServeLocal website/",
+                             otherwise set to "ServeLocal website")
+       - Start Command:     node server.js
+       - Port:              Railway sets $PORT automatically — server.js
+                             already reads process.env.PORT
+
+  5. Add environment variables in Railway dashboard (Settings > Variables):
+
+       JWT_SECRET=<generate a long random string, e.g. 64 chars>
+       ADMIN_EMAIL=admin@servelocal.org
+       RESEND_API_KEY=re_xxxxxxxxxxxx  (see Email section below)
+       APP_URL=https://your-app.up.railway.app
+
+  6. Railway gives you a URL like https://servelocal-production.up.railway.app
+     Optionally add a custom domain in Settings > Networking > Custom Domain
+
+  IMPORTANT — db.json persistence:
+     Railway's filesystem is ephemeral (resets on redeploy). Options:
+       a) Use Railway's volume mount to persist /data
+       b) Migrate to a real database (SQLite file on a volume, or Postgres)
+       c) For MVP/demo: accept that data resets on redeploy, seed fresh
+
+
+================================================================================
+  3. CUSTOM DOMAIN
+================================================================================
+
+  If you buy a domain (e.g. servelocal.org):
+
+  1. In Railway > Settings > Networking > Custom Domain, add: servelocal.org
+  2. Railway gives you a CNAME target. Go to your DNS provider and add:
+
+       Type: CNAME
+       Name: @  (or www)
+       Value: <railway-provided-target>.railway.app
+
+  3. Railway auto-provisions SSL (HTTPS) — no extra setup needed
+  4. Update APP_URL env var to: https://servelocal.org
+
+
+================================================================================
+  4. EMAIL SENDING (Resend)
+================================================================================
+
+  The app uses Resend (https://resend.com) for transactional emails:
+    - Email verification codes
+    - Application status notifications
+    - Org approval notifications
+
+  Setup:
+  1. Create a free account at https://resend.com (100 emails/day free)
+  2. Go to API Keys > Create API Key
+  3. Set RESEND_API_KEY in your .env or Railway env vars
+
+  For production (custom domain):
+  1. In Resend > Domains, add your domain (e.g. servelocal.org)
+  2. Add the DNS records Resend provides (SPF, DKIM, DMARC)
+  3. Update FROM_EMAIL in server.js from 'onboarding@resend.dev' to:
+       'ServeLocal <noreply@servelocal.org>'
+
+  Without a verified domain, Resend only sends to the account owner's email.
+  With a verified domain, it sends to anyone.
+
+
+================================================================================
+  5. CALENDAR SYNC (webcal:// subscription)
+================================================================================
+
+  HOW IT WORKS:
+    The server exposes a .ics feed at:
+      GET /api/calendar/:userId/:token.ics
+
+    - Each student gets a unique URL with an HMAC token (no login needed)
+    - The token is derived from the user's ID + server secret
+    - Calendar apps (Apple Calendar, Google Calendar, Outlook) subscribe to
+      this URL and poll it periodically (every 1-24 hours)
+    - Every time the calendar app fetches the URL, it gets the LATEST events
+    - Sign up or unsubscribe on ServeLocal -> next calendar refresh picks it up
+
+  ON LOCALHOST (current state):
+    - webcal:// won't work because calendar apps can't reach localhost
+    - The toggle downloads a .ics file instead (manual import)
+    - After each sign-up/unsubscribe, a fresh .ics auto-downloads if sync is ON
+
+  AFTER DEPLOY:
+    - webcal:// links work automatically — no code changes needed
+    - The frontend detects it's not on localhost and uses webcal:// protocol
+    - Student clicks the toggle ON -> browser opens their default calendar app
+      with a subscription prompt -> they accept -> done forever
+    - Apple Calendar refreshes subscribed calendars ~every 1 hour
+    - Google Calendar refreshes ~every 12-24 hours (not configurable)
+    - Outlook refreshes ~every 3 hours
+
+  NOTHING TO CONFIGURE — it just works once you have a public URL.
+
+
+================================================================================
+  6. ENVIRONMENT VARIABLES SUMMARY
+================================================================================
+
+  Required for production:
+  ┌──────────────────────┬─────────────────────────────────────────────┐
+  | Variable             | Description                                 |
+  ├──────────────────────┼─────────────────────────────────────────────┤
+  | PORT                 | Set automatically by Railway                |
+  | JWT_SECRET           | Random string, 64+ chars. Used for auth     |
+  |                      | tokens AND calendar feed HMAC tokens.       |
+  |                      | CHANGING THIS INVALIDATES ALL SESSIONS      |
+  |                      | AND CALENDAR SUBSCRIPTIONS.                 |
+  | ADMIN_EMAIL          | Admin login email (default: admin@...)      |
+  | RESEND_API_KEY       | API key from resend.com for sending email   |
+  └──────────────────────┴─────────────────────────────────────────────┘
+
+  Optional / future:
+  ┌──────────────────────┬─────────────────────────────────────────────┐
+  | APP_URL              | Your public URL (for email links, etc.)     |
+  | DATABASE_URL         | If you migrate to Postgres                  |
+  | GOOGLE_MAPS_API_KEY  | If you add real map integration             |
+  └──────────────────────┴─────────────────────────────────────────────┘
+
+  Example .env file (create at ServeLocal website/.env):
+
+    JWT_SECRET=your-very-long-random-secret-string-here-make-it-64-chars
+    ADMIN_EMAIL=admin@servelocal.org
+    RESEND_API_KEY=re_123456789
+
+
+================================================================================
+  7. PRE-DEPLOY CHECKLIST
+================================================================================
+
+  [ ] .gitignore includes: db.json, .env, node_modules/
+  [ ] JWT_SECRET is a strong random value (not the default)
+  [ ] RESEND_API_KEY is set and domain is verified in Resend
+  [ ] FROM_EMAIL in server.js updated to your domain
+  [ ] Test login, signup, and email verification on the live URL
+  [ ] Test calendar subscription with webcal:// on the live URL
+  [ ] Set up Railway volume or database for db.json persistence
+  [ ] (Optional) Configure custom domain + DNS
+
+
+================================================================================
+  8. FUTURE FEATURES THAT WILL NEED DEPLOY CONFIG
+================================================================================
+
+  When adding these features, update this file:
+
+  - OAuth login (Google/GitHub)     -> Need OAuth client ID/secret + redirect URI
+  - File uploads (profile pics)     -> Need cloud storage (S3, Cloudflare R2)
+  - Push notifications              -> Need web push VAPID keys
+  - Analytics                       -> Need analytics service key
+  - Rate limiting / abuse prevention-> Consider Redis or in-memory with TTL
+  - Real database migration         -> Postgres connection string
+
+
+================================================================================
+  9. STRIPE — ORG PRO PLAN & DONATIONS (currently DEMO mode)
+================================================================================
+
+  The site already has the full monetization UI/flow, but checkout is in
+  DEMO mode: no real payment is collected. Two flows need Stripe to go live:
+
+    a) Org Pro plan ($19/mo)  -> POST /api/billing/upgrade   (server.js)
+    b) Supporter donations    -> POST /api/donations         (server.js)
+
+  To go live:
+  1. Create a Stripe account, get keys: STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET
+  2. Pro plan: replace the body of POST /api/billing/upgrade with creating a
+     Stripe Checkout Session (mode:'subscription', a $19/mo Price). Set
+     user.plan='pro' in the checkout.session.completed webhook handler —
+     NOT in the upgrade route.
+  3. Donations: replace POST /api/donations with a Checkout Session
+     (mode:'payment'); record the donation in the webhook.
+  4. Add a webhook route (e.g. POST /api/stripe/webhook) and verify the
+     signature with STRIPE_WEBHOOK_SECRET. Note: that route must read the
+     RAW request body for signature verification (the readBody() helper
+     JSON-parses — bypass it for this one route).
+  5. Handle customer.subscription.deleted -> set user.plan='free' and clear
+     featured flags (same as /api/billing/downgrade).
+  6. Remove the "demo mode" copy in public/index.html (pricing page, donate
+     page, upgrade dialog).
+
+  Until then, demo upgrades/donations are flagged with demo:true in db.json.
+
+
+================================================================================

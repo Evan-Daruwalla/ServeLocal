@@ -1,0 +1,13 @@
+Emoji graphics in this directory are from Twemoji.
+
+Copyright 2019 Twitter, Inc and other contributors.
+Source: https://github.com/jdecked/twemoji (maintained fork; v15.1.0, 72x72 PNG set)
+
+Graphics licensed under CC-BY 4.0: https://creativecommons.org/licenses/by/4.0/
+
+This is the FULL Twemoji 72x72 PNG set (~3.8k files, ~3.4 MB) so any emoji in
+user-generated content renders consistently. The twemojify() helper in
+public/index.html clusters text into emoji graphemes (Intl.Segmenter) and swaps
+each for the matching <codepoint>.png here. manifest.json lists the bundled
+files (reference/tooling only; the helper does not read it at runtime — it
+derives the filename and falls back to text if a file is absent).

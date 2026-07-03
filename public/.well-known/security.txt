@@ -1,0 +1,5 @@
+Contact: mailto:security@servelocal.org
+Expires: 2027-06-18T00:00:00.000Z
+Preferred-Languages: en
+Policy: https://servelocal.org/SECURITY.md
+# Please report security issues responsibly. See SECURITY.md for scope and process.

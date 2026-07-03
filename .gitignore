@@ -1,0 +1,22 @@
+# Secrets — never commit
+.env
+*.pem
+
+# Database & backups (contain PII; regenerated/seeded at runtime)
+db.json
+db.json.*.tmp
+backups/
+
+# Dependencies (none today, but keep ignored)
+node_modules/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.log
+
+# Claude Code / ruflo tooling & runtime state (personal, not project source)
+.claude/
+.mcp.json
+.claude-flow/
+.swarm/

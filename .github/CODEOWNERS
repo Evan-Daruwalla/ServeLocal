@@ -1,0 +1,9 @@
+# Default owners for everything in the repo. Replace with your GitHub handle/team.
+# All PRs require review from a code owner before merge (enable "Require review
+# from Code Owners" in branch protection).
+* @servelocal-maintainers
+
+# Security-sensitive surfaces warrant extra scrutiny.
+/server.js              @servelocal-maintainers
+/docs/security.md       @servelocal-maintainers
+/.github/               @servelocal-maintainers

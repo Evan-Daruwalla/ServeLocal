@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # ServeLocal has zero runtime npm dependencies by design (ADR-0001). This keeps
+  # GitHub Actions pinned and patched, and will flag any future deps automatically.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
