@@ -12,3 +12,5 @@ Consequences. Add a new numbered file (don't edit accepted ones; supersede inste
 - [0007 — CSP retains `unsafe-inline` for the inline SPA](./0007-csp-unsafe-inline-tradeoff.md)
 - [0008 — Coarse cache invalidation by global version bump](./0008-cache-invalidation-strategy.md)
 - [0009 — scrypt password hashing with transparent migration](./0009-scrypt-password-hashing.md)
+- [0010 — Guardian consent is a precondition, not a feature](./0010-guardian-consent-precondition.md)
+- [0011 — In-memory indexes over the JSON store](./0011-in-memory-indexes.md)

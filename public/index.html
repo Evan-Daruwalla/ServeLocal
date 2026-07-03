@@ -134,6 +134,12 @@ img.emoji{height:1em;width:1em;margin:0 .06em 0 .08em;vertical-align:-0.12em;dis
 #support-banner button{background:none;border:none;color:rgba(255,255,255,.5);cursor:pointer;float:right;font-size:1rem;line-height:1;margin-top:-1px;transition:color .15s}
 #support-banner button:hover{color:rgba(255,255,255,.8)}
 
+/* ── GUARDIAN CONSENT BANNER (students under 18 awaiting/declined approval) ── */
+#guardian-consent-banner{background:#fff3e0;color:#7c4a03;text-align:center;padding:10px 20px;font-size:.8rem;display:none;border-bottom:1px solid #ffcc80}
+#guardian-consent-banner button{background:none;border:1px solid var(--amber);color:#7c4a03;border-radius:6px;padding:3px 12px;font-size:.75rem;font-weight:600;cursor:pointer;margin-left:10px;transition:all .15s}
+#guardian-consent-banner button:hover:not(:disabled){background:var(--amber);color:#fff}
+#guardian-consent-banner button:disabled{opacity:.5;cursor:default}
+
 /* ── VIEWS ── */
 .view{display:none;animation:fadeIn .3s var(--ease)}
 .view.active{display:block}
@@ -752,6 +758,12 @@ textarea.fc{resize:vertical;min-height:90px}
 <div id="support-banner">
   💚 ServeLocal is <strong>free forever for students</strong> — supporters and org Pro plans keep it that way. <a onclick="nav('donate');loadDonate()">Become a supporter →</a>
   <button onclick="this.parentElement.style.display='none'" aria-label="Dismiss this message">×</button>
+</div>
+
+<!-- GUARDIAN CONSENT BANNER (students under 18 awaiting/declined guardian approval) -->
+<div id="guardian-consent-banner" role="status">
+  <span id="guardian-consent-banner-text"></span>
+  <button id="guardian-consent-resend-btn" onclick="resendGuardianConsent()">Resend email</button>
 </div>
 
 <!-- NAV -->
@@ -1455,6 +1467,34 @@ textarea.fc{resize:vertical;min-height:90px}
   </div>
 </div>
 
+<!-- GUARDIAN CONSENT — public, no login required (see docs/guardian-consent-spec.md) -->
+<div class="view" id="view-consent">
+  <div class="section" style="max-width:520px">
+    <div class="sec-tag">Guardian Approval</div>
+    <h2 class="sec-title" style="margin-bottom:6px">Approve ServeLocal account</h2>
+    <p class="sec-sub" id="consent-sub" style="margin-bottom:28px"></p>
+    <div id="consent-error" class="ferr" style="display:none"></div>
+    <div id="consent-actions" style="display:none;gap:12px">
+      <button class="fsubmit" style="flex:1" onclick="submitConsentDecision('approve')">Approve</button>
+      <button class="btn-s" style="flex:1" onclick="submitConsentDecision('decline')">Decline</button>
+    </div>
+    <p id="consent-done" style="display:none"></p>
+  </div>
+</div>
+
+<div class="view" id="view-consent-manage">
+  <div class="section" style="max-width:520px">
+    <div class="sec-tag">Guardian Approval</div>
+    <h2 class="sec-title" style="margin-bottom:6px">Manage your consent</h2>
+    <p class="sec-sub" id="consent-manage-sub" style="margin-bottom:28px"></p>
+    <div id="consent-manage-error" class="ferr" style="display:none"></div>
+    <div id="consent-manage-actions" style="display:none">
+      <button class="btn-s" onclick="confirmRevokeConsent()">Revoke approval</button>
+    </div>
+    <p id="consent-manage-done" style="display:none"></p>
+  </div>
+</div>
+
 </main>
 
 <!-- ══════════════ MODALS ══════════════ -->
@@ -1491,11 +1531,15 @@ textarea.fc{resize:vertical;min-height:90px}
           <div class="fr" style="margin-bottom:0"><label>Last Name (legal) <span style="color:var(--red)">*</span></label><input class="fc" id="sr-last" placeholder="Johnson"></div>
         </div>
         <div style="height:14px"></div>
-        <div class="fr"><label>Date of Birth <span style="color:var(--red)">*</span></label><input class="fc" id="sr-dob" type="date"><div class="fhint">Must be 12 or older. Required for award tracking.</div></div>
+        <div class="fr"><label>Date of Birth <span style="color:var(--red)">*</span></label><input class="fc" id="sr-dob" type="date" oninput="checkStudentAge()"><div class="fhint">Must be 12 or older. Required for award tracking.</div></div>
         <div class="fr"><label>Email <span style="color:var(--red)">*</span></label><input class="fc" id="sr-email" type="email" placeholder="you@example.com"></div>
         <div class="fr"><label>Password <span style="color:var(--red)">*</span> (min 8 characters)</label><input class="fc" id="sr-pw" type="password" placeholder="••••••••"></div>
         <div class="fr"><label>School <span style="color:var(--muted);font-weight:400">(optional)</span></label><input class="fc" id="sr-school" placeholder="Lincoln High School"></div>
         <div class="fr"><label>Location <span style="color:var(--muted);font-weight:400">(optional — for distance estimates)</span></label><input class="fc" id="sr-loc" placeholder="Springfield, IL"></div>
+        <div id="sr-guardian-fields" style="display:none">
+          <div class="fr"><label>Parent/Guardian Name <span style="color:var(--red)">*</span></label><input class="fc" id="sr-guardian-name" placeholder="Jamie Johnson"></div>
+          <div class="fr"><label>Parent/Guardian Email <span style="color:var(--red)">*</span></label><input class="fc" id="sr-guardian-email" type="email" placeholder="parent@example.com"><div class="fhint">Since you're under 18, we'll email your parent/guardian to approve your account before you can sign up for opportunities.</div></div>
+        </div>
         <button class="fsubmit" style="width:100%" onclick="doStudentReg()">Create Student Account</button>
         <p style="font-size:.8rem;color:var(--muted);text-align:center;margin-top:14px">Already have an account? <span style="color:var(--green);cursor:pointer;font-weight:600" onclick="switchAuth('login')">Log in</span></p>
       </div>
@@ -1895,7 +1939,7 @@ async function api(endpoint, opts={}) {
       continue;
     }
     let data={}; try{ data=await res.json(); }catch{}
-    if (!res.ok) throw new Error(data.error||'Request failed');
+    if (!res.ok) { const e=new Error(data.error||'Request failed'); e.code=data.code; throw e; }
     return data;
   }
   throw lastErr||new Error('Request failed');
@@ -1953,6 +1997,7 @@ function setUser(u) {
   if (u.role==='student') {
     document.getElementById('support-banner').style.display='block';
     setNavActive('nl-dash');
+    updateGuardianConsentBanner(u);
   } else if (u.role==='org') {
     setNavActive('nl-org');
     setText('ods-name', u.orgName);
@@ -1968,8 +2013,39 @@ function logout() {
   document.getElementById('nav-right').innerHTML = `<button class="nav-btn nb-outline" onclick="openAuth('login')">Log In</button><button class="nav-btn nb-solid" onclick="openAuth('register')">Sign Up Free</button>`;
   updateNav(null);
   document.getElementById('support-banner').style.display='none';
+  document.getElementById('guardian-consent-banner').style.display='none';
   nav('home');
   toast('Logged out');
+}
+
+// Reflects the current student's guardianConsentStatus in the persistent banner.
+// 'verified' and 'not_required' (18+) show nothing — see docs/guardian-consent-spec.md.
+function updateGuardianConsentBanner(u) {
+  const banner = document.getElementById('guardian-consent-banner');
+  const text = document.getElementById('guardian-consent-banner-text');
+  const btn = document.getElementById('guardian-consent-resend-btn');
+  const status = u.guardianConsentStatus;
+  if (status==='pending'||status==='legacy_pending') {
+    text.textContent = `We emailed ${u.guardianName||'your parent/guardian'} for approval — you can browse opportunities now, but can't sign up for one until they respond.`;
+    btn.style.display='inline-block';
+    banner.style.display='block';
+  } else if (status==='declined'||status==='revoked') {
+    text.textContent = `Your parent/guardian ${status==='declined'?'declined':'revoked'} approval for your ServeLocal account. Contact support@servelocal.org for help.`;
+    btn.style.display='none';
+    banner.style.display='block';
+  } else {
+    banner.style.display='none';
+  }
+}
+
+async function resendGuardianConsent() {
+  const btn = document.getElementById('guardian-consent-resend-btn');
+  btn.disabled = true;
+  try {
+    await api('/api/account/consent/resend',{method:'POST',body:'{}'});
+    toast('Approval email resent.');
+  } catch(e) { toast(e.message,'err'); }
+  finally { btn.disabled = false; }
 }
 
 // ── NOTIFICATIONS ───────────────────────────
@@ -2667,7 +2743,11 @@ async function applyToOpp(id, title, requiresApproval, signupType, singleDate) {
   } catch(e) {
     const btn = document.getElementById('apply-btn');
     if (btn) { btn.disabled=false; btn.textContent = requiresApproval?'Request to Join':'Sign Up'; }
-    toast(e.message,'err');
+    if (e.code==='GUARDIAN_CONSENT_REQUIRED') {
+      toast(`Ask ${currentUser.guardianName||'your parent/guardian'} to check their email and approve your account first.`,'err');
+    } else {
+      toast(e.message,'err');
+    }
   }
 }
 
@@ -3703,15 +3783,30 @@ async function doLogin() {
   } catch(e){err.textContent=e.message;err.style.display='block';}
 }
 
+// Shows/hides the parent/guardian fields as the DOB field changes — students
+// under 18 need guardian consent (see docs/guardian-consent-spec.md); 18+
+// students never see or submit these fields.
+function checkStudentAge() {
+  const dob = val('sr-dob');
+  const fields = document.getElementById('sr-guardian-fields');
+  const age = dob ? (Date.now()-new Date(dob))/(365.25*864e5) : null;
+  fields.style.display = (age!==null && age<18) ? 'block' : 'none';
+}
+
 async function doStudentReg() {
   const err=document.getElementById('sreg-err'); err.style.display='none';
-  const payload={firstName:val('sr-first'),lastName:val('sr-last'),dob:val('sr-dob'),email:val('sr-email'),password:val('sr-pw'),school:val('sr-school'),location:val('sr-loc')};
+  const dob = val('sr-dob');
+  const isMinor = dob && (Date.now()-new Date(dob))/(365.25*864e5) < 18;
+  const payload={firstName:val('sr-first'),lastName:val('sr-last'),dob,email:val('sr-email'),password:val('sr-pw'),school:val('sr-school'),location:val('sr-loc')};
+  if (isMinor) { payload.guardianName=val('sr-guardian-name'); payload.guardianEmail=val('sr-guardian-email'); }
   if (!payload.firstName||!payload.lastName||!payload.dob||!payload.email||!payload.password){err.textContent='Please fill in all required fields.';err.style.display='block';return;}
+  if (isMinor && (!payload.guardianName||!payload.guardianEmail)){err.textContent='Parent/guardian name and email are required for students under 18.';err.style.display='block';return;}
   if (payload.password.length<8){err.textContent='Password must be at least 8 characters.';err.style.display='block';return;}
   try {
     const res=await api('/api/auth/register/student',{method:'POST',body:JSON.stringify(payload)});
     token=res.token; localStorage.setItem('sl_token',token);
-    setUser(res.user); closeM('auth-overlay'); toast('Welcome to ServeLocal! 🎉');
+    setUser(res.user); closeM('auth-overlay');
+    toast(res.user.guardianConsentStatus==='pending' ? 'Account created! We emailed your parent/guardian for approval.' : 'Welcome to ServeLocal! 🎉');
     await loadStudentDash();
   } catch(e){err.textContent=e.message;err.style.display='block';}
 }
@@ -3956,6 +4051,82 @@ function switchOrgDash(panel, btn) {
 }
 
 // ── HASH ROUTING / DEEP LINKS ─────────────────
+// ── GUARDIAN CONSENT (public views — see docs/guardian-consent-spec.md) ──
+let _consentToken = null;
+async function loadConsentView(token) {
+  _consentToken = token;
+  nav('consent');
+  const sub = document.getElementById('consent-sub');
+  const err = document.getElementById('consent-error');
+  const actions = document.getElementById('consent-actions');
+  const done = document.getElementById('consent-done');
+  err.style.display='none'; done.style.display='none'; actions.style.display='none';
+  sub.textContent = 'Loading…';
+  try {
+    const r = await api('/api/consent/'+token);
+    sub.textContent = `${r.studentFirstName} ${r.studentLastInitial}. wants to join ServeLocal, a platform connecting students with community service opportunities. Because they're under 18, we need your approval before they can sign up for an opportunity or message an organization.`;
+    actions.style.display = 'flex';
+  } catch(e) {
+    sub.textContent = '';
+    err.textContent = e.message;
+    err.style.display = 'block';
+  }
+}
+async function submitConsentDecision(decision) {
+  const actions = document.getElementById('consent-actions');
+  const done = document.getElementById('consent-done');
+  const err = document.getElementById('consent-error');
+  err.style.display = 'none';
+  try {
+    await api('/api/consent/'+_consentToken, {method:'POST', body:JSON.stringify({decision})});
+    actions.style.display = 'none';
+    done.style.display = 'block';
+    done.textContent = decision==='approve'
+      ? "Thanks! You've approved this account — we've emailed you a link to manage or revoke your approval later."
+      : "You've declined this account. The student will need to contact support@servelocal.org to proceed.";
+  } catch(e) { err.textContent = e.message; err.style.display = 'block'; }
+}
+
+let _consentManageToken = null;
+async function loadConsentManageView(token) {
+  _consentManageToken = token;
+  nav('consent-manage');
+  const sub = document.getElementById('consent-manage-sub');
+  const err = document.getElementById('consent-manage-error');
+  const actions = document.getElementById('consent-manage-actions');
+  const done = document.getElementById('consent-manage-done');
+  err.style.display='none'; done.style.display='none'; actions.style.display='none';
+  sub.textContent = 'Loading…';
+  try {
+    const r = await api('/api/consent/manage/'+token);
+    if (r.status==='revoked') {
+      sub.textContent = '';
+      done.style.display = 'block';
+      done.textContent = `You've already revoked approval for ${r.studentFirstName} ${r.studentLastInitial}.'s ServeLocal account.`;
+    } else {
+      sub.textContent = `You previously approved ${r.studentFirstName} ${r.studentLastInitial}.'s ServeLocal account. You can revoke that approval at any time.`;
+      actions.style.display = 'block';
+    }
+  } catch(e) {
+    sub.textContent = '';
+    err.textContent = e.message;
+    err.style.display = 'block';
+  }
+}
+async function confirmRevokeConsent() {
+  if (!confirm('Revoke approval for this ServeLocal account? The student will no longer be able to sign up for opportunities, message organizations, or check in until approval is granted again.')) return;
+  const actions = document.getElementById('consent-manage-actions');
+  const done = document.getElementById('consent-manage-done');
+  const err = document.getElementById('consent-manage-error');
+  err.style.display = 'none';
+  try {
+    await api('/api/consent/manage/'+_consentManageToken, {method:'POST', body:JSON.stringify({action:'revoke'})});
+    actions.style.display = 'none';
+    done.style.display = 'block';
+    done.textContent = 'Approval revoked.';
+  } catch(e) { err.textContent = e.message; err.style.display = 'block'; }
+}
+
 let _routing = false;
 function pushHash(h){
   if (_routing) return;
@@ -3976,6 +4147,8 @@ async function routeFromHash(){
     else if (page==='org-info') { nav('org-info'); }
     else if (page==='privacy') { nav('privacy'); }
     else if (page==='terms') { nav('terms'); }
+    else if (page==='consent'&&param) { await loadConsentView(param); }
+    else if (page==='consent-manage'&&param) { await loadConsentManageView(param); }
     else if (page==='dash'||page==='org-dash') {
       if (currentUser?.role==='org') await loadOrgDash();
       else if (currentUser?.role==='student') await loadStudentDash();

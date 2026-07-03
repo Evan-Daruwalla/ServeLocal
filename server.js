@@ -64,6 +64,10 @@ if (!IS_PROD && ADMIN_PASSWORD === DEFAULT_ADMIN_PASSWORD) {
 }
 // Token lifetime is configurable; default 7 days. Shorter = tighter session window.
 const TOKEN_TTL_MS = (Number(process.env.TOKEN_TTL_HOURS) || 168) * 36e5;
+// Guardian-consent one-time approval link lifetime; default 72h.
+const CONSENT_TOKEN_TTL_HOURS = Number(process.env.CONSENT_TOKEN_TTL_HOURS) || 72;
+const CONSENT_TOKEN_TTL_MS = CONSENT_TOKEN_TTL_HOURS * 36e5;
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
 
 // CORS allowlist. Empty (dev default) => permissive "*". In production set
 // ALLOWED_ORIGINS to a comma-separated list of exact origins to lock down CORS.
@@ -141,6 +145,53 @@ function cacheSet(key, data, ttlMs = 10000) {
   return data;
 }
 function bumpCache() { _cacheVersion++; if (_cache.size > 500) _cache.clear(); }
+
+// ── IN-MEMORY INDEXES (primary + foreign key) ──
+// The whole JSON store lives in memory, so without indexes every lookup is an O(n)
+// Array.find/filter scan — and the hot handlers do several per request. These Maps
+// make id / foreign-key lookups O(1). They're *derived* state: rebuilt lazily
+// whenever the DB object is swapped (load/seed/restore/tests) OR any write bumps
+// `_cacheVersion` — the same coarse invalidation the read cache uses, so an index
+// can never return state older than the last save. Read only via IDX(); never hold
+// the returned object across a write (it may be rebuilt underneath you).
+let _idx = null, _idxVersion = -1, _idxDbRef = null;
+function buildIndexes() {
+  const byId = arr => { const m = new Map(); for (const x of arr) m.set(x.id, x); return m; };
+  // Group into Map<key, item[]>; skips null/undefined keys so a missing FK doesn't bucket.
+  const group = (arr, key) => { const m = new Map(); for (const x of arr) { const k = x[key]; if (k == null) continue; let g = m.get(k); if (!g) m.set(k, g = []); g.push(x); } return m; };
+  const usersByEmail = new Map(); for (const u of DB.users) if (u.email) usersByEmail.set(u.email, u);
+  const usersByOrgId = new Map(); for (const u of DB.users) if (u.orgId) usersByOrgId.set(u.orgId, u);
+  _idx = {
+    userById: byId(DB.users),
+    userByEmail: usersByEmail,
+    userByOrgId: usersByOrgId,               // one org user per orgId
+    oppById: byId(DB.opportunities),
+    appById: byId(DB.applications),
+    hoursById: byId(DB.hours),
+    appsByOpp: group(DB.applications, 'oppId'),
+    appsByUser: group(DB.applications, 'userId'),
+    hoursByUser: group(DB.hours, 'userId'),
+    notifsByUser: group(DB.notifications, 'userId'),
+    messagesByOpp: group(DB.messages, 'oppId'),
+    reviewsByOrg: group(DB.reviews, 'orgId'),
+    oppsByOrg: group(DB.opportunities, 'orgId'),
+    endorsementsByUser: group(DB.endorsements, 'userId'),
+  };
+  _idxVersion = _cacheVersion;
+  _idxDbRef = DB;
+}
+function IDX() {
+  if (_idx === null || _idxDbRef !== DB || _idxVersion !== _cacheVersion) buildIndexes();
+  return _idx;
+}
+// Convenience: foreign-key groups return a shared [] when empty so callers can
+// iterate/spread without null checks (never mutate the returned array in place).
+const _EMPTY = Object.freeze([]);
+function idxList(map, key) { return map.get(key) || _EMPTY; }
+// Owned-opportunity lookup: O(1) by id, then the ownership guard. Returns undefined
+// if the id is unknown or the opp belongs to another org (same result the old
+// `find(o=>o.id===X && o.orgId===Y)` produced, so downstream !opp checks are unchanged).
+function ownedOpp(oppId, orgId) { const o = IDX().oppById.get(oppId); return o && o.orgId === orgId ? o : undefined; }
 
 // ── RATE LIMITER (per-IP token bucket) ────────
 // Abuse prevention layered on top of the auth-specific login throttle.
@@ -353,6 +404,10 @@ function seedDB() {
     skills: ['Tutoring','Gardening','Social Media'],
     causes: ['Education','Environment'],
     savedOpps: [], signedUpOpps: [], emailVerified: true, portfolioPublic: false, savedSearches: [],
+    guardianName: '', guardianEmail: '', guardianConsentStatus: 'not_required',
+    guardianConsentTokenHash: '', guardianConsentTokenExpires: null, guardianManageTokenHash: '',
+    guardianConsentRequestedAt: '', guardianConsentDecidedAt: null,
+    guardianConsentIp: '', guardianConsentUserAgent: '',
     createdAt: iso()
   };
   DB.users.push(student);
@@ -564,7 +619,7 @@ function getUser(req) {
   if (!token) return null;
   const d = verifyToken(token);
   if (!d) return null;
-  const u = DB.users.find(u=>u.id===d.sub);
+  const u = IDX().userById.get(d.sub);
   if (!u) return null;
   // Reject tokens issued before the user's current token version (revoked sessions)
   if ((d.tv||0) !== (u.tokenVersion||0)) return null;
@@ -596,6 +651,10 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const FROM_EMAIL = 'ServeLocal <onboarding@resend.dev>';
 
 function sendEmail(to, subject, bodyText) {
+  if (!RESEND_API_KEY) {
+    console.log('📧 [dev, no RESEND_API_KEY] would email', to, '—', subject, '\n' + bodyText);
+    return;
+  }
   const payload = JSON.stringify({
     from: FROM_EMAIL,
     to: [to],
@@ -633,6 +692,34 @@ function sendEmail(to, subject, bodyText) {
 
 function generateCode() {
   return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+// ── GUARDIAN CONSENT (minors only — see docs/guardian-consent-spec.md) ──
+// Every student under 18 needs a verified guardian email on file before they can
+// apply to an opportunity, message an org, redeem a check-in code, or be endorsed.
+// 18+ students are never gated. Age is recomputed live (not cached) so a student
+// who ages into adulthood while a request is pending is unblocked automatically.
+function hashToken(token) { return crypto.createHash('sha256').update(token).digest('hex'); }
+function studentAge(dob) { return (Date.now() - new Date(dob)) / (365.25 * 864e5); }
+function requireGuardianConsent(user) {
+  if (!user || user.role !== 'student') return null; // orgs/admin unaffected
+  if (studentAge(user.dob) >= 18) return null; // adults are never gated, regardless of stored status
+  if (user.guardianConsentStatus === 'verified') return null;
+  return { error: 'Guardian approval is required before you can do this.', code: 'GUARDIAN_CONSENT_REQUIRED' };
+}
+function sendGuardianConsentEmail(student, token) {
+  const link = `${PUBLIC_BASE_URL}/#consent/${token}`;
+  sendEmail(student.guardianEmail, `Approve ${student.firstName}'s ServeLocal account`,
+    `${student.guardianName},\n\n${student.firstName} ${student.lastName} signed up for ServeLocal, ` +
+    `a platform connecting students with community service opportunities. Because they're under 18, ` +
+    `we need your approval before they can sign up for an opportunity or message an organization.\n\n` +
+    `Approve or decline here (expires in ${CONSENT_TOKEN_TTL_HOURS} hours):\n${link}\n\n— ServeLocal`);
+}
+function sendGuardianManageEmail(student, manageToken) {
+  const link = `${PUBLIC_BASE_URL}/#consent-manage/${manageToken}`;
+  sendEmail(student.guardianEmail, `You approved ${student.firstName}'s ServeLocal account`,
+    `Thanks for approving ${student.firstName}'s ServeLocal account. If you ever want to revoke this ` +
+    `approval, you can do so anytime here:\n${link}\n\n— ServeLocal`);
 }
 
 // ── HTTP HELPERS ──────────────────────────────
@@ -808,28 +895,51 @@ async function router(req, res) {
 
   // POST /api/auth/register/student
   if (method==='POST' && p==='/api/auth/register/student') {
-    const {firstName,lastName,dob,email,password,school,grade,location} = body;
+    const {firstName,lastName,dob,email,password,school,grade,location,guardianName,guardianEmail} = body;
     if (!firstName||!lastName||!dob||!email||!password)
       return json(res,{error:'First name, last name, date of birth, email and password are required'},400);
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json(res,{error:'Enter a valid email address'},400);
     if (password.length<8) return json(res,{error:'Password must be at least 8 characters'},400);
     if (weakPassword(password,email)) return json(res,{error:'That password is too common or easy to guess. Please choose a stronger one.'},400);
-    if (DB.users.find(u=>u.email===email.toLowerCase()))
+    if (IDX().userByEmail.get(email.toLowerCase()))
       return json(res,{error:'Email already registered'},409);
     // Age check — must be 12+
     const age = (Date.now()-new Date(dob))/(365.25*864e5);
     if (age<12) return json(res,{error:'You must be at least 12 years old to register'},400);
+
+    // Guardian consent — required for under-18 students; 18+ students skip it entirely
+    // (see docs/guardian-consent-spec.md and ADR-0010).
+    const isMinor = age < 18;
+    if (isMinor) {
+      if (!guardianName||!guardianEmail) return json(res,{error:'Parent/guardian name and email are required for students under 18'},400);
+      if (!isEmail(guardianEmail)) return json(res,{error:'Enter a valid parent/guardian email address'},400);
+      if (guardianEmail.toLowerCase()===email.toLowerCase()) return json(res,{error:'Parent/guardian email must be different from your own email'},400);
+    }
+
     const u = {
       id:uid(), role:'student', email:email.toLowerCase(),
       passwordHash:'', salt:'',
       firstName, lastName, dob,
       school:school||'', grade:grade||'', location:location||'',
       skills:[], causes:[], savedOpps:[], signedUpOpps:[],
-      emailVerified:true, portfolioPublic:false, savedSearches:[], createdAt:iso()
+      emailVerified:true, portfolioPublic:false, savedSearches:[], createdAt:iso(),
+      guardianName: isMinor ? sstr(guardianName,120) : '',
+      guardianEmail: isMinor ? guardianEmail.toLowerCase() : '',
+      guardianConsentStatus: isMinor ? 'pending' : 'not_required',
+      guardianConsentTokenHash: '', guardianConsentTokenExpires: null, guardianManageTokenHash: '',
+      guardianConsentRequestedAt: isMinor ? iso() : '', guardianConsentDecidedAt: null,
+      guardianConsentIp: '', guardianConsentUserAgent: '',
     };
     setPassword(u, password); // scrypt
     DB.users.push(u);
     appendAudit(u.id,'account.register',u.id,{role:'student'});
+    if (isMinor) {
+      const token = crypto.randomBytes(32).toString('hex');
+      u.guardianConsentTokenHash = hashToken(token);
+      u.guardianConsentTokenExpires = new Date(Date.now()+CONSENT_TOKEN_TTL_MS).toISOString();
+      sendGuardianConsentEmail(u, token);
+      appendAudit(u.id,'account.guardian_consent_requested',u.id,{guardianEmail:u.guardianEmail});
+    }
     saveDB();
     return json(res,{token:makeToken(u),user:safeUser(u)},201);
   }
@@ -843,7 +953,7 @@ async function router(req, res) {
     if (password!==confirmPassword) return json(res,{error:'Passwords do not match'},400);
     if (password.length<8) return json(res,{error:'Password must be at least 8 characters'},400);
     if (weakPassword(password,email)) return json(res,{error:'That password is too common or easy to guess. Please choose a stronger one.'},400);
-    if (DB.users.find(u=>u.email===email.toLowerCase())) return json(res,{error:'Email already registered'},409);
+    if (IDX().userByEmail.get(email.toLowerCase())) return json(res,{error:'Email already registered'},409);
 
     const isFree = isFreeEmailDomain(email);
     // If using free domain and NOT opting out → block
@@ -882,7 +992,7 @@ async function router(req, res) {
     if (attempts && Date.now()-attempts.first >= 15*60*1000) loginAttempts.delete(throttleKey);
     else if (attempts && attempts.count >= 8)
       return json(res,{error:'Too many failed attempts. Please try again in 15 minutes.'},429);
-    const found = DB.users.find(u=>u.email===email?.toLowerCase());
+    const found = email ? IDX().userByEmail.get(email.toLowerCase()) : null;
     if (!found||!verifyPassword(password,found)) {
       const rec = loginAttempts.get(throttleKey)||{count:0,first:Date.now()};
       rec.count++; loginAttempts.set(throttleKey,rec);
@@ -910,7 +1020,7 @@ async function router(req, res) {
   if (method==='POST' && p==='/api/account/password') {
     if (!user) return json(res,{error:'Unauthorized'},401);
     const {currentPassword,newPassword} = body;
-    const me = DB.users.find(u=>u.id===user.id);
+    const me = IDX().userById.get(user.id);
     if (!currentPassword||!verifyPassword(currentPassword,me))
       return json(res,{error:'Current password is incorrect'},401);
     if (!newPassword||newPassword.length<8) return json(res,{error:'New password must be at least 8 characters'},400);
@@ -928,6 +1038,93 @@ async function router(req, res) {
   if (method==='GET' && p==='/api/auth/me') {
     if (!user) return json(res,{error:'Unauthorized'},401);
     return json(res,safeUser(user));
+  }
+
+  // ══════════════════════════════════════════
+  // GUARDIAN CONSENT (minors only — see docs/guardian-consent-spec.md, ADR-0010)
+  // ══════════════════════════════════════════
+
+  // GET /api/consent/:token — public; lets a guardian preview who they're approving
+  const consentToken = p.match(/^\/api\/consent\/([^/]+)$/);
+  if (method==='GET' && consentToken) {
+    const tokenHash = hashToken(consentToken[1]);
+    const student = DB.users.find(u=>u.role==='student'&&u.guardianConsentTokenHash&&timingEqualHex(u.guardianConsentTokenHash,tokenHash));
+    if (!student) return json(res,{error:'Invalid or already-used consent link'},404);
+    if (new Date(student.guardianConsentTokenExpires) < new Date())
+      return json(res,{error:'This consent link has expired. Ask your student to resend it.',code:'CONSENT_TOKEN_EXPIRED'},410);
+    return json(res,{studentFirstName:student.firstName, studentLastInitial:(student.lastName||'')[0]||''});
+  }
+
+  // POST /api/consent/:token — public; guardian approves or declines
+  if (method==='POST' && consentToken) {
+    const tokenHash = hashToken(consentToken[1]);
+    const idx = DB.users.findIndex(u=>u.role==='student'&&u.guardianConsentTokenHash&&timingEqualHex(u.guardianConsentTokenHash,tokenHash));
+    if (idx===-1) return json(res,{error:'Invalid or already-used consent link'},404);
+    const student = DB.users[idx];
+    if (new Date(student.guardianConsentTokenExpires) < new Date())
+      return json(res,{error:'This consent link has expired. Ask your student to resend it.',code:'CONSENT_TOKEN_EXPIRED'},410);
+    const {decision} = body;
+    if (decision!=='approve'&&decision!=='decline') return json(res,{error:'decision must be "approve" or "decline"'},400);
+
+    student.guardianConsentDecidedAt = iso();
+    student.guardianConsentIp = ip;
+    student.guardianConsentUserAgent = String(req.headers['user-agent']||'').slice(0,300);
+    student.guardianConsentTokenHash = ''; // single-use
+    student.guardianConsentTokenExpires = null;
+
+    if (decision==='approve') {
+      student.guardianConsentStatus = 'verified';
+      const manageToken = crypto.randomBytes(32).toString('hex');
+      student.guardianManageTokenHash = hashToken(manageToken);
+      sendGuardianManageEmail(student, manageToken);
+      createNotification(student.id,'guardian_consent_verified','Guardian Approved!','Your parent/guardian approved your ServeLocal account — you can now sign up for opportunities.','dash');
+    } else {
+      student.guardianConsentStatus = 'declined';
+      createNotification(student.id,'guardian_consent_declined','Guardian Declined','Your parent/guardian did not approve your ServeLocal account. Contact support@servelocal.org for help.','dash');
+    }
+    appendAudit('guardian:'+student.id,'account.guardian_consent_decided',student.id,{decision,ip});
+    saveDB();
+    return json(res,{status:student.guardianConsentStatus});
+  }
+
+  // GET/POST /api/consent/manage/:manageToken — public; guardian revokes consent anytime
+  const consentManage = p.match(/^\/api\/consent\/manage\/([^/]+)$/);
+  if ((method==='GET'||method==='POST') && consentManage) {
+    const tokenHash = hashToken(consentManage[1]);
+    const idx = DB.users.findIndex(u=>u.role==='student'&&u.guardianManageTokenHash&&timingEqualHex(u.guardianManageTokenHash,tokenHash));
+    if (idx===-1) return json(res,{error:'Invalid consent-management link'},404);
+    const student = DB.users[idx];
+    if (method==='GET')
+      return json(res,{studentFirstName:student.firstName, studentLastInitial:(student.lastName||'')[0]||'', status:student.guardianConsentStatus});
+    if (body.action!=='revoke') return json(res,{error:'action must be "revoke"'},400);
+    student.guardianConsentStatus = 'revoked';
+    student.guardianConsentDecidedAt = iso();
+    student.guardianConsentIp = ip;
+    student.guardianConsentUserAgent = String(req.headers['user-agent']||'').slice(0,300);
+    createNotification(student.id,'guardian_consent_revoked','Guardian Revoked Approval','Your parent/guardian revoked approval for your ServeLocal account.','dash');
+    appendAudit('guardian:'+student.id,'account.guardian_consent_revoked',student.id,{ip});
+    saveDB();
+    return json(res,{status:'revoked'});
+  }
+
+  // POST /api/account/consent/resend — authenticated student; 5-minute cooldown
+  if (method==='POST' && p==='/api/account/consent/resend') {
+    if (!user||user.role!=='student') return json(res,{error:'Unauthorized'},401);
+    if (studentAge(user.dob)>=18) return json(res,{error:'Guardian consent is not required for your account'},400);
+    if (user.guardianConsentStatus==='verified') return json(res,{error:'Guardian consent is already verified'},400);
+    if (user.guardianConsentStatus!=='pending'&&user.guardianConsentStatus!=='legacy_pending')
+      return json(res,{error:'Contact support@servelocal.org to update your guardian consent status.'},400);
+    const idx = DB.users.findIndex(u=>u.id===user.id);
+    if (DB.users[idx].guardianConsentRequestedAt && Date.now()-new Date(DB.users[idx].guardianConsentRequestedAt).getTime() < 5*60*1000)
+      return json(res,{error:'Please wait a few minutes before resending.'},429);
+    const token = crypto.randomBytes(32).toString('hex');
+    DB.users[idx].guardianConsentTokenHash = hashToken(token);
+    DB.users[idx].guardianConsentTokenExpires = new Date(Date.now()+CONSENT_TOKEN_TTL_MS).toISOString();
+    DB.users[idx].guardianConsentRequestedAt = iso();
+    sendGuardianConsentEmail(DB.users[idx], token);
+    appendAudit(user.id,'account.guardian_consent_requested',user.id,{guardianEmail:DB.users[idx].guardianEmail,resend:true});
+    saveDB();
+    return json(res,{status:DB.users[idx].guardianConsentStatus});
   }
 
   // ══════════════════════════════════════════
@@ -977,7 +1174,7 @@ async function router(req, res) {
     const radiusMiles = Math.min(parseFloat(maxMiles)||15, 50); // default 15 mi, cap 50
     let opps = DB.opportunities.filter(o=>{
       if (!o.active) return false;
-      const org = DB.users.find(u=>u.orgId===o.orgId);
+      const org = IDX().userByOrgId.get(o.orgId);
       if (org && !org.adminApproved) return false;
       return true;
     });
@@ -1001,10 +1198,10 @@ async function router(req, res) {
     opps = opps.map(o=>{
       const ac = DB.applications.filter(a=>a.oppId===o.id&&a.status==='approved').length;
       // Compute org badges
-      const org = DB.users.find(u=>u.orgId===o.orgId);
+      const org = IDX().userByOrgId.get(o.orgId);
       const badges = [];
       if (org?.adminApproved) badges.push('verified');
-      const orgReviews = DB.reviews.filter(r=>r.orgId===o.orgId);
+      const orgReviews = idxList(IDX().reviewsByOrg,o.orgId);
       if (orgReviews.length>=3) { const avg=orgReviews.reduce((s,r)=>s+r.rating,0)/orgReviews.length; if(avg>=4.5) badges.push('top-rated'); }
       const orgOppIds = DB.opportunities.filter(x=>x.orgId===o.orgId).map(x=>x.id);
       const resolved = DB.applications.filter(a=>orgOppIds.includes(a.oppId)&&a.resolvedAt).slice(-10);
@@ -1020,7 +1217,7 @@ async function router(req, res) {
   // GET /api/opportunities/:id/date-spots  →  per-occurrence spot counts for recurring events
   const dateSpotsMatch = p.match(/^\/api\/opportunities\/([^/]+)\/date-spots$/);
   if (method==='GET' && dateSpotsMatch) {
-    const opp = DB.opportunities.find(o=>o.id===dateSpotsMatch[1]);
+    const opp = IDX().oppById.get(dateSpotsMatch[1]);
     if (!opp) return json(res,{error:'Not found'},404);
     const commit = opp.commitment;
     if (commit!=='Weekly'&&commit!=='Monthly') return json(res,{});
@@ -1046,10 +1243,10 @@ async function router(req, res) {
   // GET /api/opportunities/:id
   const oppById = p.match(/^\/api\/opportunities\/([^/]+)$/);
   if (method==='GET' && oppById) {
-    const opp = DB.opportunities.find(o=>o.id===oppById[1]);
+    const opp = IDX().oppById.get(oppById[1]);
     if (!opp) return json(res,{error:'Not found'},404);
     const isOwner = user && ((user.role==='org'&&user.orgId===opp.orgId) || user.role==='admin');
-    const oppOrg = DB.users.find(u=>u.orgId===opp.orgId);
+    const oppOrg = IDX().userByOrgId.get(opp.orgId);
     if (!isOwner && (!opp.active || !oppOrg?.adminApproved)) return json(res,{error:'Not found'},404);
     const applicants = DB.applications.filter(a=>a.oppId===opp.id&&a.status==='approved').length;
     return json(res, isOwner ? {...opp,applicantCount:applicants} : {...publicOpp(opp),applicantCount:applicants});
@@ -1148,7 +1345,7 @@ async function router(req, res) {
   const reactivateMatch = p.match(/^\/api\/opportunities\/([^/]+)\/reactivate$/);
   if (method==='PATCH' && reactivateMatch) {
     if (!user||user.role!=='org') return json(res,{error:'Unauthorized'},401);
-    const oppR = DB.opportunities.find(o=>o.id===reactivateMatch[1]);
+    const oppR = IDX().oppById.get(reactivateMatch[1]);
     if (!oppR) return json(res,{error:'Listing not found'},404);
     if (oppR.orgId!==user.orgId) return json(res,{error:'Unauthorized'},401);
     const rPlan = orgPlan(user);
@@ -1164,7 +1361,7 @@ async function router(req, res) {
   const permDeleteMatch = p.match(/^\/api\/opportunities\/([^/]+)\/permanent$/);
   if (method==='DELETE' && permDeleteMatch) {
     if (!user||user.role!=='org') return json(res,{error:'Unauthorized'},401);
-    const oppP = DB.opportunities.find(o=>o.id===permDeleteMatch[1]);
+    const oppP = IDX().oppById.get(permDeleteMatch[1]);
     if (!oppP) return json(res,{error:'Listing not found'},404);
     if (oppP.orgId!==user.orgId) return json(res,{error:'Unauthorized'},401);
     const oppPId = oppP.id;
@@ -1184,8 +1381,10 @@ async function router(req, res) {
   const applyMatch = p.match(/^\/api\/opportunities\/([^/]+)\/apply$/);
   if (method==='POST' && applyMatch) {
     if (!user||user.role!=='student') return json(res,{error:'Must be logged in as student'},401);
-    const opp = DB.opportunities.find(o=>o.id===applyMatch[1]&&o.active);
-    if (!opp) return json(res,{error:'Opportunity not found'},404);
+    const consentBlock = requireGuardianConsent(user);
+    if (consentBlock) return json(res,consentBlock,403);
+    const opp = IDX().oppById.get(applyMatch[1]);
+    if (!opp || !opp.active) return json(res,{error:'Opportunity not found'},404);
     if (opp.spotsRemaining===0) return json(res,{error:'No spots remaining'},400);
 
     const signupType = body.signupType || 'subscription';
@@ -1215,7 +1414,7 @@ async function router(req, res) {
     // Conflict check
     const conflicts = DB.applications
       .filter(a=>a.userId===user.id&&a.status==='approved')
-      .map(a=>DB.opportunities.find(o=>o.id===a.oppId))
+      .map(a=>IDX().oppById.get(a.oppId))
       .filter(Boolean)
       .filter(o=>timesOverlap(opp.startTime,opp.endTime,o.startTime,o.endTime));
 
@@ -1245,7 +1444,7 @@ async function router(req, res) {
   const excludeMatch = p.match(/^\/api\/opportunities\/([^/]+)\/exclude-date$/);
   if (method==='PATCH' && excludeMatch) {
     if (!user||user.role!=='student') return json(res,{error:'Must be logged in as student'},401);
-    const opp = DB.opportunities.find(o=>o.id===excludeMatch[1]);
+    const opp = IDX().oppById.get(excludeMatch[1]);
     if (!opp) return json(res,{error:'Opportunity not found'},404);
     const sub = DB.applications.find(a=>a.oppId===opp.id&&a.userId===user.id&&(a.type||'subscription')==='subscription');
     if (!sub) return json(res,{error:'No subscription found'},404);
@@ -1273,7 +1472,7 @@ async function router(req, res) {
   const unsubMatch = p.match(/^\/api\/opportunities\/([^/]+)\/unsubscribe$/);
   if (method==='DELETE' && unsubMatch) {
     if (!user||user.role!=='student') return json(res,{error:'Must be logged in as student'},401);
-    const opp = DB.opportunities.find(o=>o.id===unsubMatch[1]);
+    const opp = IDX().oppById.get(unsubMatch[1]);
     if (!opp) return json(res,{error:'Opportunity not found'},404);
     const singleDate = body.singleDate || null;
     const isRecurring = opp.commitment==='Weekly'||opp.commitment==='Monthly';
@@ -1325,9 +1524,9 @@ async function router(req, res) {
   // GET /api/applications/my  (student's own)
   if (method==='GET' && p==='/api/applications/my') {
     if (!user||user.role!=='student') return json(res,{error:'Unauthorized'},401);
-    const apps = DB.applications.filter(a=>a.userId===user.id);
+    const apps = idxList(IDX().appsByUser,user.id);
     const enriched = apps.map(a=>{
-      const opp = DB.opportunities.find(o=>o.id===a.oppId);
+      const opp = IDX().oppById.get(a.oppId);
       return {...a, opp: publicOpp(opp)};
     });
     return json(res,enriched);
@@ -1336,7 +1535,7 @@ async function router(req, res) {
   // GET /api/applications/org  (org sees applicants for their opps)
   if (method==='GET' && p==='/api/applications/org') {
     if (!user||user.role!=='org') return json(res,{error:'Unauthorized'},401);
-    const orgOppIds = DB.opportunities.filter(o=>o.orgId===user.orgId).map(o=>o.id);
+    const orgOppIds = idxList(IDX().oppsByOrg,user.orgId).map(o=>o.id);
     return json(res, DB.applications.filter(a=>orgOppIds.includes(a.oppId)));
   }
 
@@ -1346,7 +1545,7 @@ async function router(req, res) {
     if (!user||user.role!=='org') return json(res,{error:'Unauthorized'},401);
     const idx = DB.applications.findIndex(a=>a.id===appPatch[1]);
     if (idx===-1) return json(res,{error:'Not found'},404);
-    const opp = DB.opportunities.find(o=>o.id===DB.applications[idx].oppId&&o.orgId===user.orgId);
+    const opp = ownedOpp(DB.applications[idx].oppId, user.orgId);
     if (!opp) return json(res,{error:'Forbidden'},403);
     const {action} = body;
     const prevStatus = DB.applications[idx].status;
@@ -1385,10 +1584,10 @@ async function router(req, res) {
   if (method==='POST' && p==='/api/hours/auto-log-attended') {
     if (!user||user.role!=='student') return json(res,{error:'Unauthorized'},401);
     const today = new Date(); today.setHours(0,0,0,0);
-    const approvedApps = DB.applications.filter(a=>a.userId===user.id&&a.status==='approved');
+    const approvedApps = idxList(IDX().appsByUser,user.id).filter(a=>a.status==='approved');
     let created = 0;
     for (const app of approvedApps) {
-      const opp = DB.opportunities.find(o=>o.id===app.oppId);
+      const opp = IDX().oppById.get(app.oppId);
       if (!opp||!opp.startTime) continue;
       const durHrs = opp.durationHours || (opp.endTime?(new Date(opp.endTime)-new Date(opp.startTime))/36e5:0);
       if (durHrs<=0) continue;
@@ -1435,12 +1634,12 @@ async function router(req, res) {
   // GET /api/hours  (student: own; org: pending for their opps)
   if (method==='GET' && p==='/api/hours') {
     if (!user) return json(res,{error:'Unauthorized'},401);
-    if (user.role==='student') return json(res, DB.hours.filter(h=>h.userId===user.id));
+    if (user.role==='student') return json(res, idxList(IDX().hoursByUser,user.id));
     if (user.role==='org') {
-      const orgOppIds = DB.opportunities.filter(o=>o.orgId===user.orgId).map(o=>o.id);
+      const orgOppIds = idxList(IDX().oppsByOrg,user.orgId).map(o=>o.id);
       const pending = DB.hours.filter(h=>orgOppIds.includes(h.oppId)&&['pending','verified','denied'].includes(h.status));
       return json(res, pending.map(h=>{
-        const s = DB.users.find(u=>u.id===h.userId);
+        const s = IDX().userById.get(h.userId);
         return {...h, studentName:s?`${s.firstName} ${s.lastName}`:'Unknown', studentEmail:s?.email||''};
       }));
     }
@@ -1460,7 +1659,7 @@ async function router(req, res) {
     let resolvedOppId = oppId||null;
 
     if (oppId) {
-      const opp = DB.opportunities.find(o=>o.id===oppId);
+      const opp = IDX().oppById.get(oppId);
       if (opp) { resolvedOrgName = opp.orgName; }
     }
 
@@ -1490,7 +1689,7 @@ async function router(req, res) {
     if (!user||user.role!=='org') return json(res,{error:'Unauthorized'},401);
     const idx = DB.hours.findIndex(h=>h.id===hoursVerify[1]);
     if (idx===-1) return json(res,{error:'Not found'},404);
-    const orgOppIds = DB.opportunities.filter(o=>o.orgId===user.orgId).map(o=>o.id);
+    const orgOppIds = idxList(IDX().oppsByOrg,user.orgId).map(o=>o.id);
     if (DB.hours[idx].oppId && !orgOppIds.includes(DB.hours[idx].oppId))
       return json(res,{error:'Forbidden'},403);
     const {action,supervisorName,note} = body;
@@ -1541,15 +1740,15 @@ async function router(req, res) {
     if (!user) return json(res,{error:'Unauthorized'},401);
     const {password} = body;
     if (!password) return json(res,{error:'Password required to delete account'},400);
-    const fullUser = DB.users.find(u=>u.id===user.id);
+    const fullUser = IDX().userById.get(user.id);
     if (!verifyPassword(password, fullUser))
       return json(res,{error:'Incorrect password'},401);
     // Remove user data
     DB.users.splice(DB.users.indexOf(fullUser), 1);
     if (user.role==='student') {
       // Free any one-time spots this student held, then promote waitlists
-      DB.applications.filter(a=>a.userId===user.id&&a.status==='approved').forEach(a=>{
-        const heldOpp = DB.opportunities.find(o=>o.id===a.oppId);
+      idxList(IDX().appsByUser,user.id).filter(a=>a.status==='approved').forEach(a=>{
+        const heldOpp = IDX().oppById.get(a.oppId);
         if (heldOpp && heldOpp.commitment!=='Weekly' && heldOpp.commitment!=='Monthly')
           heldOpp.spotsRemaining = Math.min(heldOpp.spotsAvailable,(heldOpp.spotsRemaining||0)+1);
       });
@@ -1559,7 +1758,7 @@ async function router(req, res) {
       DB.reviews = DB.reviews.filter(r=>r.userId!==user.id);
       DB.messages = DB.messages.filter(m=>m.senderId!==user.id);
     } else if (user.role==='org') {
-      const orgOppIds = DB.opportunities.filter(o=>o.orgId===user.orgId).map(o=>o.id);
+      const orgOppIds = idxList(IDX().oppsByOrg,user.orgId).map(o=>o.id);
       DB.opportunities = DB.opportunities.filter(o=>o.orgId!==user.orgId);
       DB.applications = DB.applications.filter(a=>!orgOppIds.includes(a.oppId));
       DB.messages = DB.messages.filter(m=>!orgOppIds.includes(m.oppId));
@@ -1598,13 +1797,13 @@ async function router(req, res) {
   if (method==='GET' && msgGet) {
     if (!user) return json(res,{error:'Unauthorized'},401);
     const oppId = msgGet[1];
-    const opp = DB.opportunities.find(o=>o.id===oppId);
+    const opp = IDX().oppById.get(oppId);
     if (!opp) return json(res,{error:'Not found'},404);
     // Only signed-up students and the org can see messages
     const isOrg = user.role==='org'&&user.orgId===opp.orgId;
     const isStudent = user.role==='student'&&DB.applications.find(a=>a.oppId===oppId&&a.userId===user.id&&a.status==='approved');
     if (!isOrg&&!isStudent) return json(res,{error:'Forbidden'},403);
-    return json(res, DB.messages.filter(m=>m.oppId===oppId).sort((a,b)=>new Date(a.createdAt)-new Date(b.createdAt)));
+    return json(res, [...idxList(IDX().messagesByOpp,oppId)].sort((a,b)=>new Date(a.createdAt)-new Date(b.createdAt)));
   }
 
   // POST /api/messages/:oppId
@@ -1612,11 +1811,15 @@ async function router(req, res) {
   if (method==='POST' && msgPost) {
     if (!user) return json(res,{error:'Unauthorized'},401);
     const oppId = msgPost[1];
-    const opp = DB.opportunities.find(o=>o.id===oppId);
+    const opp = IDX().oppById.get(oppId);
     if (!opp) return json(res,{error:'Not found'},404);
     const isOrg = user.role==='org'&&user.orgId===opp.orgId;
     const isStudent = user.role==='student'&&DB.applications.find(a=>a.oppId===oppId&&a.userId===user.id&&a.status==='approved');
     if (!isOrg&&!isStudent) return json(res,{error:'Forbidden'},403);
+    // Defense in depth: an approved application already implies verified consent
+    // (or 18+) at apply time, but re-check live so a post-approval guardian
+    // revoke (§ manage/revoke) blocks new messages immediately.
+    if (isStudent) { const consentBlock = requireGuardianConsent(user); if (consentBlock) return json(res,consentBlock,403); }
     const msg = {
       id:uid(), oppId, senderId:user.id,
       senderName: user.role==='org' ? user.orgName : `${user.firstName} ${user.lastName}`,
@@ -1634,7 +1837,7 @@ async function router(req, res) {
       });
     } else {
       // Notify the org
-      const orgUser = DB.users.find(u=>u.orgId===opp.orgId);
+      const orgUser = IDX().userByOrgId.get(opp.orgId);
       if (orgUser) createNotification(orgUser.id, 'new_message', 'New Message', senderName+' sent a message in "'+opp.title+'"', 'chat:'+oppId);
     }
     saveDB();
@@ -1648,7 +1851,7 @@ async function router(req, res) {
   // GET /api/reviews/:orgId
   const reviewsGet = p.match(/^\/api\/reviews\/([^/]+)$/);
   if (method==='GET' && reviewsGet) {
-    return json(res, DB.reviews.filter(r=>r.orgId===reviewsGet[1]));
+    return json(res, idxList(IDX().reviewsByOrg,reviewsGet[1]));
   }
 
   // POST /api/reviews/:orgId
@@ -1684,7 +1887,7 @@ async function router(req, res) {
   // GET /api/org/:orgId/reviews  (dedicated, with userId for auth checking)
   const orgReviewsRoute = p.match(/^\/api\/org\/([^/]+)\/reviews$/);
   if (method==='GET' && orgReviewsRoute) {
-    const reviews = DB.reviews.filter(r=>r.orgId===orgReviewsRoute[1]);
+    const reviews = idxList(IDX().reviewsByOrg,orgReviewsRoute[1]);
     const enriched = reviews.map(r=>({...r, isOwn: user?.id===r.userId}));
     const avg = reviews.length ? Math.round(reviews.reduce((s,r)=>s+r.rating,0)/reviews.length*10)/10 : null;
     const dist = [5,4,3,2,1].map(n=>({stars:n,count:reviews.filter(r=>r.rating===n).length}));
@@ -1713,10 +1916,10 @@ async function router(req, res) {
   // GET /api/org/:orgId/profile
   const orgProfile = p.match(/^\/api\/org\/([^/]+)\/profile$/);
   if (method==='GET' && orgProfile) {
-    const org = DB.users.find(u=>u.orgId===orgProfile[1]&&u.role==='org');
+    const org = IDX().userByOrgId.get(orgProfile[1]);
     if (!org) return json(res,{error:'Not found'},404);
     const opps = DB.opportunities.filter(o=>o.orgId===orgProfile[1]&&o.active);
-    const reviews = DB.reviews.filter(r=>r.orgId===orgProfile[1]);
+    const reviews = idxList(IDX().reviewsByOrg,orgProfile[1]);
     const avgRating = reviews.length ? Math.round(reviews.reduce((s,r)=>s+r.rating,0)/reviews.length*10)/10 : null;
     // Compute org badges
     const orgBadges = [];
@@ -1764,6 +1967,16 @@ async function router(req, res) {
   if (method==='GET' && p==='/api/admin/orgs/all') {
     if (!user||user.role!=='admin') return json(res,{error:'Unauthorized'},401);
     return json(res, DB.users.filter(u=>u.role==='org').map(safeUser));
+  }
+
+  // GET /api/admin/consent/pending — minors awaiting guardian consent >3 days
+  if (method==='GET' && p==='/api/admin/consent/pending') {
+    if (!requireRole(user,'admin')) return json(res,{error:'Unauthorized'},401);
+    const cutoff = Date.now()-3*864e5;
+    const stuck = DB.users.filter(u=>u.role==='student'
+      &&(u.guardianConsentStatus==='pending'||u.guardianConsentStatus==='legacy_pending')
+      &&new Date(u.guardianConsentRequestedAt).getTime()<cutoff);
+    return json(res, stuck.map(safeUser));
   }
 
   // PATCH /api/admin/orgs/:userId
@@ -1814,7 +2027,7 @@ async function router(req, res) {
   if (method==='GET' && p==='/api/admin/reports') {
     if (!user||user.role!=='admin') return json(res,{error:'Unauthorized'},401);
     const enriched = DB.reports.map(r=>{
-      const org = DB.users.find(u=>u.orgId===r.orgId);
+      const org = IDX().userByOrgId.get(r.orgId);
       return {...r, orgName:org?.orgName||'Unknown'};
     });
     return json(res,enriched);
@@ -1834,7 +2047,7 @@ async function router(req, res) {
   // GET /api/org/opportunities  (org's own listings)
   if (method==='GET' && p==='/api/org/opportunities') {
     if (!user||user.role!=='org') return json(res,{error:'Unauthorized'},401);
-    const opps = DB.opportunities.filter(o=>o.orgId===user.orgId);
+    const opps = idxList(IDX().oppsByOrg,user.orgId);
     return json(res, opps.map(o=>({...o, applicantCount:DB.applications.filter(a=>a.oppId===o.id&&a.status==='approved').length})));
   }
 
@@ -1859,8 +2072,8 @@ async function router(req, res) {
   if (method==='GET' && calMatch) {
     const calUserId = calMatch[1];
     const calToken  = calMatch[2];
-    const calUser   = DB.users.find(u => u.id === calUserId && u.role === 'student');
-    if (!calUser) return json(res, {error:'Not found'}, 404);
+    const calUser   = IDX().userById.get(calUserId);
+    if (!calUser || calUser.role !== 'student') return json(res, {error:'Not found'}, 404);
     // Verify token: HMAC of the userId with the server secret
     const expectedToken = crypto.createHmac('sha256', SECRET).update(calUserId).digest('hex').slice(0, 24);
     if (calToken !== expectedToken) return json(res, {error:'Forbidden'}, 403);
@@ -1929,12 +2142,12 @@ async function router(req, res) {
     if (!user) return json(res,{error:'Unauthorized'},401);
     const limit = parseInt(parsed.query.limit)||30;
     const offset = parseInt(parsed.query.offset)||0;
-    const all = DB.notifications.filter(n=>n.userId===user.id).sort((a,b)=>b.createdAt.localeCompare(a.createdAt));
+    const all = [...idxList(IDX().notifsByUser,user.id)].sort((a,b)=>b.createdAt.localeCompare(a.createdAt));
     return json(res, { notifications:all.slice(offset,offset+limit), total:all.length });
   }
   if (method==='GET' && p==='/api/notifications/unread-count') {
     if (!user) return json(res,{error:'Unauthorized'},401);
-    return json(res, { count:DB.notifications.filter(n=>n.userId===user.id&&!n.read).length });
+    return json(res, { count:idxList(IDX().notifsByUser,user.id).filter(n=>!n.read).length });
   }
   const notifRead = p.match(/^\/api\/notifications\/([^/]+)\/read$/);
   if (method==='PATCH' && notifRead) {
@@ -1947,7 +2160,7 @@ async function router(req, res) {
   }
   if (method==='PATCH' && p==='/api/notifications/read-all') {
     if (!user) return json(res,{error:'Unauthorized'},401);
-    DB.notifications.filter(n=>n.userId===user.id&&!n.read).forEach(n=>n.read=true);
+    idxList(IDX().notifsByUser,user.id).filter(n=>!n.read).forEach(n=>n.read=true);
     saveDB();
     return json(res,{ok:true});
   }
@@ -1959,10 +2172,13 @@ async function router(req, res) {
     if (!user||user.role!=='org') return json(res,{error:'Unauthorized'},401);
     const {userId:targetId,oppId,skills} = body;
     if (!targetId||!oppId||!skills||!skills.length) return json(res,{error:'userId, oppId, and skills[] required'},400);
-    const opp = DB.opportunities.find(o=>o.id===oppId&&o.orgId===user.orgId);
+    const opp = ownedOpp(oppId, user.orgId);
     if (!opp) return json(res,{error:'Opportunity not found or not yours'},403);
     const app = DB.applications.find(a=>a.oppId===oppId&&a.userId===targetId&&a.status==='approved');
     if (!app) return json(res,{error:'Student must have approved application'},400);
+    const targetStudent = IDX().userById.get(targetId);
+    const consentBlock = targetStudent && requireGuardianConsent(targetStudent);
+    if (consentBlock) return json(res,consentBlock,403);
     if (DB.endorsements.find(e=>e.userId===targetId&&e.oppId===oppId&&e.orgId===user.orgId)) return json(res,{error:'Already endorsed for this opportunity'},409);
     const endorsement = { id:uid(), userId:targetId, orgId:user.orgId, orgName:user.orgName, oppId, oppTitle:opp.title, skills, createdAt:iso() };
     DB.endorsements.push(endorsement);
@@ -1983,8 +2199,8 @@ async function router(req, res) {
   // ══════════════════════════════════════════
   const portfolioGet = p.match(/^\/api\/portfolio\/([^/]+)$/);
   if (method==='GET' && portfolioGet) {
-    const student = DB.users.find(u=>u.id===portfolioGet[1]&&u.role==='student');
-    if (!student) return json(res,{error:'Not found'},404);
+    const student = IDX().userById.get(portfolioGet[1]);
+    if (!student || student.role!=='student') return json(res,{error:'Not found'},404);
     // Allow owner to always see their own, otherwise check public flag
     const isOwner = user&&user.id===student.id;
     if (!isOwner&&!student.portfolioPublic) return json(res,{error:'Portfolio is private'},403);
@@ -2025,7 +2241,7 @@ async function router(req, res) {
     hours.forEach(h=>{ const d=new Date(h.startTime); const k=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0'); byMonth[k]=Math.round(((byMonth[k]||0)+h.hours)*100)/100; });
     // Hours by category
     const byCat = {};
-    hours.forEach(h=>{ const opp=DB.opportunities.find(o=>o.id===h.oppId); const cat=opp?.category||'Other'; byCat[cat]=Math.round(((byCat[cat]||0)+h.hours)*100)/100; });
+    hours.forEach(h=>{ const opp=IDX().oppById.get(h.oppId); const cat=opp?.category||'Other'; byCat[cat]=Math.round(((byCat[cat]||0)+h.hours)*100)/100; });
     // Streak (consecutive weeks with activity)
     const weekSet = new Set();
     hours.forEach(h=>{ const d=new Date(h.startTime); const w=Math.floor(d.getTime()/(7*864e5)); weekSet.add(w); });
@@ -2054,9 +2270,10 @@ async function router(req, res) {
   if (method==='GET' && p==='/api/recommendations') {
     if (!user||user.role!=='student') return json(res,{error:'Unauthorized'},401);
     let opps = DB.opportunities.filter(o=>o.active);
-    const appliedIds = DB.applications.filter(a=>a.userId===user.id).map(a=>a.oppId);
+    const myApps = idxList(IDX().appsByUser,user.id);
+    const appliedIds = myApps.map(a=>a.oppId);
     opps = opps.filter(o=>!appliedIds.includes(o.id));
-    const pastCommit = DB.applications.filter(a=>a.userId===user.id&&a.status==='approved').map(a=>DB.opportunities.find(o=>o.id===a.oppId)?.commitment).filter(Boolean);
+    const pastCommit = myApps.filter(a=>a.status==='approved').map(a=>IDX().oppById.get(a.oppId)?.commitment).filter(Boolean);
     opps = opps.map(o=>{
       let score=0;
       (o.skills||[]).forEach(s=>{ if((user.skills||[]).includes(s)) score+=3; });
@@ -2097,7 +2314,7 @@ async function router(req, res) {
   if (method==='GET' && p==='/api/awards') {
     if (!user||user.role!=='student') return json(res,{error:'Unauthorized'},401);
     const verifiedHours = DB.hours.filter(h=>h.userId===user.id&&h.status==='verified').reduce((s,h)=>s+h.hours,0);
-    const allHours = DB.hours.filter(h=>h.userId===user.id).reduce((s,h)=>s+h.hours,0);
+    const allHours = idxList(IDX().hoursByUser,user.id).reduce((s,h)=>s+h.hours,0);
     return json(res, AWARDS.map(a=>({
       ...a,
       progress: Math.min(100,Math.round(verifiedHours/a.hours*100)),
@@ -2113,19 +2330,19 @@ async function router(req, res) {
   // ══════════════════════════════════════════
   if (method==='GET' && p==='/api/account/export') {
     if (!user) return json(res,{error:'Unauthorized'},401);
-    const me = safeUser(DB.users.find(u=>u.id===user.id));
+    const me = safeUser(IDX().userById.get(user.id));
     const mine = {
       exportedAt: iso(),
       account: me,
-      applications: DB.applications.filter(a=>a.userId===user.id),
-      hours: DB.hours.filter(h=>h.userId===user.id),
+      applications: idxList(IDX().appsByUser,user.id),
+      hours: idxList(IDX().hoursByUser,user.id),
       reviews: DB.reviews.filter(r=>r.userId===user.id),
-      endorsements: DB.endorsements.filter(e=>e.userId===user.id),
-      notifications: DB.notifications.filter(n=>n.userId===user.id),
+      endorsements: idxList(IDX().endorsementsByUser,user.id),
+      notifications: idxList(IDX().notifsByUser,user.id),
       messages: DB.messages.filter(m=>m.senderId===user.id),
     };
     if (user.role==='org') {
-      mine.opportunities = DB.opportunities.filter(o=>o.orgId===user.orgId);
+      mine.opportunities = idxList(IDX().oppsByOrg,user.orgId);
     }
     appendAudit(user.id,'account.data_export',''); saveDB();
     return json(res, mine, 200, {
@@ -2174,7 +2391,7 @@ async function router(req, res) {
   const featMatch = p.match(/^\/api\/opportunities\/([^/]+)\/feature$/);
   if (method==='PATCH' && featMatch) {
     if (!user||user.role!=='org') return json(res,{error:'Unauthorized'},401);
-    const opp = DB.opportunities.find(o=>o.id===featMatch[1]&&o.orgId===user.orgId);
+    const opp = ownedOpp(featMatch[1], user.orgId);
     if (!opp) return json(res,{error:'Not found'},404);
     const plan = orgPlan(user);
     const want = !!body.featured;
@@ -2191,7 +2408,7 @@ async function router(req, res) {
   // POST /api/opportunities/:id/view  (lightweight view counter for org analytics)
   const viewMatch = p.match(/^\/api\/opportunities\/([^/]+)\/view$/);
   if (method==='POST' && viewMatch) {
-    const opp = DB.opportunities.find(o=>o.id===viewMatch[1]);
+    const opp = IDX().oppById.get(viewMatch[1]);
     if (opp) { opp.views = (opp.views||0)+1; saveDB(); }
     return json(res,{ok:true});
   }
@@ -2202,8 +2419,8 @@ async function router(req, res) {
   const wlMatch = p.match(/^\/api\/opportunities\/([^/]+)\/waitlist$/);
   if (method==='POST' && wlMatch) {
     if (!user||user.role!=='student') return json(res,{error:'Must be logged in as student'},401);
-    const opp = DB.opportunities.find(o=>o.id===wlMatch[1]&&o.active);
-    if (!opp) return json(res,{error:'Opportunity not found'},404);
+    const opp = IDX().oppById.get(wlMatch[1]);
+    if (!opp || !opp.active) return json(res,{error:'Opportunity not found'},404);
     if (opp.commitment==='Weekly'||opp.commitment==='Monthly')
       return json(res,{error:'Waitlists are only available for one-time events'},400);
     if (new Date(opp.endTime||opp.startTime) < new Date())
@@ -2256,7 +2473,7 @@ async function router(req, res) {
   const ccMatch = p.match(/^\/api\/opportunities\/([^/]+)\/checkin-code$/);
   if (method==='POST' && ccMatch) {
     if (!user||user.role!=='org') return json(res,{error:'Unauthorized'},401);
-    const opp = DB.opportunities.find(o=>o.id===ccMatch[1]&&o.orgId===user.orgId);
+    const opp = ownedOpp(ccMatch[1], user.orgId);
     if (!opp) return json(res,{error:'Not found'},404);
     const dateStr = (body.date||new Date().toISOString()).slice(0,10);
     if (!opp.checkinCodes) opp.checkinCodes={};
@@ -2275,6 +2492,8 @@ async function router(req, res) {
   // POST /api/checkin — student redeems a code -> instantly verified hours
   if (method==='POST' && p==='/api/checkin') {
     if (!user||user.role!=='student') return json(res,{error:'Must be logged in as student'},401);
+    const consentBlock = requireGuardianConsent(user);
+    if (consentBlock) return json(res,consentBlock,403);
     const code = String(body.code||'').trim().toUpperCase();
     if (!code) return json(res,{error:'Code required'},400);
     let opp=null, dateStr=null;
@@ -2318,7 +2537,7 @@ async function router(req, res) {
   // ══════════════════════════════════════════
   if (method==='GET' && p==='/api/org/analytics') {
     if (!user||user.role!=='org') return json(res,{error:'Unauthorized'},401);
-    const opps = DB.opportunities.filter(o=>o.orgId===user.orgId);
+    const opps = idxList(IDX().oppsByOrg,user.orgId);
     const perListing = opps.map(o=>{
       const apps = DB.applications.filter(a=>a.oppId===o.id);
       const approved = apps.filter(a=>a.status==='approved').length;
@@ -2351,7 +2570,7 @@ async function router(req, res) {
   // PATCH /api/hours/bulk-verify  (org verifies all pending entries at once)
   if (method==='PATCH' && p==='/api/hours/bulk-verify') {
     if (!user||user.role!=='org') return json(res,{error:'Unauthorized'},401);
-    const orgOppIds = DB.opportunities.filter(o=>o.orgId===user.orgId).map(o=>o.id);
+    const orgOppIds = idxList(IDX().oppsByOrg,user.orgId).map(o=>o.id);
     const pending = DB.hours.filter(h=>h.status==='pending'&&h.oppId&&orgOppIds.includes(h.oppId));
     pending.forEach(h=>{
       h.status = 'verified';
@@ -2367,7 +2586,7 @@ async function router(req, res) {
     if (!user||user.role!=='org') return json(res,{error:'Unauthorized'},401);
     if (!orgPlan(user).rosterExport)
       return json(res,{error:'Volunteer roster export is a ServeLocal Pro feature.',code:'PRO_REQUIRED'},403);
-    const oppIds = DB.opportunities.filter(o=>o.orgId===user.orgId).map(o=>o.id);
+    const oppIds = idxList(IDX().oppsByOrg,user.orgId).map(o=>o.id);
     const rows = DB.applications.filter(a=>oppIds.includes(a.oppId)).map(a=>{
       const vh = Math.round(DB.hours.filter(h=>h.userId===a.userId&&h.oppId===a.oppId&&h.status==='verified').reduce((s,h)=>s+h.hours,0)*100)/100;
       return { name:a.userName, email:a.userEmail, opportunity:a.oppTitle||'', status:a.status, signedUp:(a.createdAt||'').slice(0,10), verifiedHours:vh };
@@ -2446,7 +2665,7 @@ async function router(req, res) {
 // (defined below the router). promptOrgToVerify is the shared helper they call.
 function promptOrgToVerify(opp, dateStr){
   // Find the org user
-  const orgUser = DB.users.find(u=>u.orgId===opp.orgId);
+  const orgUser = IDX().userByOrgId.get(opp.orgId);
   if(!orgUser) return;
   // Find approved attendees for this event/date
   const approvedApps = DB.applications.filter(a=>a.oppId===opp.id&&a.status==='approved');
@@ -2455,7 +2674,7 @@ function promptOrgToVerify(opp, dateStr){
   if(durHrs<=0) return;
 
   for(const app of approvedApps){
-    const student = DB.users.find(u=>u.id===app.userId);
+    const student = IDX().userById.get(app.userId);
     if(!student) continue;
     const appType = app.type||'subscription';
 
@@ -2530,7 +2749,7 @@ function startBackgroundJobs() {
     const now=Date.now();
     let changed=false;
     DB.applications.filter(a=>a.status==='approved').forEach(a=>{
-      const opp=DB.opportunities.find(o=>o.id===a.oppId);
+      const opp=IDX().oppById.get(a.oppId);
       if(!opp) return;
       const until=new Date(opp.startTime).getTime()-now;
       if(until>0&&until<=24*36e5&&!a.reminder24h){
@@ -2636,6 +2855,7 @@ module.exports = {
   start, buildServer, router, loadDB, saveDB, seedDB, backupSnapshot, restoreFromBackup, retentionPurge,
   appendAudit, verifyAuditChain, makeToken, verifyToken, hashPassword, hashPasswordScrypt, verifyPassword, setPassword, weakPassword, publicOpp, sstr, clampNum, isEmail,
   calcHours, isValidOccurrence, nextOccurrenceAfter, orgPlan, rateLimit, makeBreaker,
+  IDX, idxList, bumpCache,
   get DB(){ return DB; }, set DB(v){ DB = v; },
   PLANS, AWARDS,
 };
