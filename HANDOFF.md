@@ -30,7 +30,7 @@ is gone. Track 2 (notifications → messaging → Stripe → growth) has not sta
 | Frontend editorial restyle | **Done** | `10b0d05` |
 | Scaling cost optimizations (ADR-0012) | **Done** | `65ced71`; coalesced writes, indexed hot reads, bounded notifications, HTTP caching |
 | `npm run bench` / `npm run loadtest:scale` tooling | **Done** | `43ef219`, `a2164d4`; repeatable before/after + real HTTP numbers |
-| **SQLite migration + `/api/opportunities` pagination (ADR-0013)** | **Done** | Removes the confirmed ~90k-user JSON-string ceiling; verified at 100k users. `npm run migrate:sqlite` for existing `db.json` deployments. Not yet committed to git — pending Evan's go-ahead |
+| **SQLite migration + `/api/opportunities` pagination (ADR-0013)** | **Done** | Removes the confirmed ~90k-user JSON-string ceiling; verified at 100k users. `npm run migrate:sqlite` for existing `db.json` deployments. Committed `da9a27f`, pushed to `origin/master` |
 | Real notifications (Track 2 #1) | **Not started** | See `docs/roadmap.md` |
 | Shift templates + bulk messaging (Track 2 #2) | **Not started** | See `docs/roadmap.md` |
 | Live Stripe billing (Track 2 #3) | **Not started** | Currently DEMO mode (ADR-0004) |
