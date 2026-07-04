@@ -13,7 +13,7 @@
 - [ ] Any new endpoint enforces auth + role + tenant ownership (no IDOR)
 - [ ] Any new opportunity-returning endpoint uses `publicOpp()` for non-owners
 - [ ] Security-relevant actions call `appendAudit(...)`
-- [ ] No secrets, PII, or `db.json` committed
+- [ ] No secrets, PII, or `db.sqlite` committed
 - [ ] Accessibility: interactive elements are keyboard-reachable and labelled
 - [ ] Docs/ADRs updated if architecture or a control changed
 

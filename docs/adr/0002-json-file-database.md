@@ -1,6 +1,8 @@
 # ADR-0002: JSON-file database with atomic writes and snapshots
 
-**Status:** Accepted (with a documented migration path)
+**Status:** Superseded by [ADR-0013](./0013-sqlite-persistence.md) for the on-disk format (the
+in-memory-model reasoning below is still accurate and unchanged — every collection still loads
+fully into memory at boot, only the on-disk representation changed).
 
 ## Context
 The dataset is small and read-heavy. A full RDBMS would add operational weight and a runtime

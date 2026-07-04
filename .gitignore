@@ -5,9 +5,11 @@
 # Database & backups (contain PII; regenerated/seeded at runtime)
 db.json
 db.json.*.tmp
+db.sqlite
+db.sqlite.*.tmp
 backups/
 
-# Dependencies (none today, but keep ignored)
+# Dependencies (better-sqlite3, ADR-0013 — a documented ADR-0001 exception)
 node_modules/
 
 # OS / editor cruft

@@ -12,9 +12,11 @@ Server runs on `http://localhost:3000` (or PORT env var).
 
 ## Architecture
 
-- **Zero dependencies** — pure Node.js `http` module, no npm, no frameworks
+- **Near-zero dependencies** — pure Node.js `http` module, no frameworks. One runtime dependency
+  (`better-sqlite3`, ADR-0013), a documented exception to the zero-dep default (ADR-0001)
 - **Single-page app** — all frontend HTML/CSS/JS lives in `public/index.html`
-- **File-based DB** — `db.json` in project root, auto-created on first run
+- **SQLite-backed DB (ADR-0013)** — `db.sqlite` in project root, auto-created on first run. One
+  dependency (`better-sqlite3`), a documented exception to ADR-0001
 - **Server** — `server.js` at project root handles API routes and static file serving
 
 ## Project Structure
@@ -29,7 +31,7 @@ ServeLocal website/
     *.png            # Derived brand assets: favicon-16/32, apple-touch-icon, og-image
   scripts/genbrand.js  # Regenerates derived brand PNGs from the master logo (zero-dep)
   .env               # Optional — PORT, etc.
-  db.json            # Auto-generated database (do not commit)
+  db.sqlite          # Auto-generated database (do not commit)
 ```
 
 ## Key Concepts
@@ -54,7 +56,7 @@ ServeLocal website/
 ## Security & Ops Infrastructure (server.js, zero-dep)
 - Full controls matrix in `docs/security.md`; architecture in `docs/architecture.md`; decisions in `docs/adr/`.
 - **Request pipeline**: rate limit (`rateLimit`, per-IP token bucket) → auth (`getUser`, checks `tokenVersion`) → idempotency (`Idempotency-Key` replay via `respond()`) → handler. Security headers (CSP/HSTS/etc.) on every response via `securityHeaders()`.
-- **Persistence**: `saveDB()` is atomic (temp + rename) and calls `bumpCache()`. Corrupt `db.json` recovers from `backups/` (newest) or reseeds on boot, then rewrites a healthy file. `backupSnapshot()` every 30 min (RPO). **`saveDBSoon()` (ADR-0012)** debounces high-frequency, low-criticality writes (view counts, notification read-flags) — one coalesced flush instead of a full-DB serialise per write; any explicit `saveDB()`/shutdown flushes the pending state. Use `saveDB()` for anything that must survive a crash; `saveDBSoon()` only for cheap-to-lose ticks.
+- **Persistence (ADR-0013)**: each of the 12 `DB_COLLECTIONS` is a SQLite table (`id`/`seq` primary key + a `data` JSON-blob column per row, via `better-sqlite3`) — but the in-memory model is unchanged: `loadDB()` still hydrates plain `DB.<collection>` arrays and every handler still reads/writes those, same as before. `saveDB()` builds a fresh sqlite file at a temp path then atomically renames it over `db.sqlite`; it and `bumpCache()` are the only things that changed. Corrupt `db.sqlite` recovers from `backups/` (newest `.sqlite` snapshot) or reseeds on boot, then rewrites a healthy file. `backupSnapshot()` every 30 min (RPO). **`saveDBSoon()` (ADR-0012)** debounces high-frequency, low-criticality writes (view counts, notification read-flags) — one coalesced flush instead of a full-DB rewrite per write; any explicit `saveDB()`/shutdown flushes the pending state. Use `saveDB()` for anything that must survive a crash; `saveDBSoon()` only for cheap-to-lose ticks. Migrating an existing `db.json`: `npm run migrate:sqlite`.
 - **Indexes (ADR-0011, refined by ADR-0012)**: hot lookups go through `IDX()` — Maps keyed by id (`userById`/`oppById`/`appById`/`hoursById`), foreign key (`appsByOpp`/`appsByUser`/`hoursByUser`/`notifsByUser`/`messagesByOpp`/`reviewsByOrg`/`oppsByOrg`/`endorsementsByUser`), plus `userByEmail`/`userByOrgId`. Derived state, rebuilt lazily when the `DB` ref changes or an **indexed** collection's *length* changes (structural signature) — NOT on every write, since field-only writes keep the reference-keyed Maps valid. This is safe only because the codebase never reassigns an id/FK in place nor replaces an array element in place; keep it that way. Use `IDX().xById.get(id)`, `ownedOpp(id,orgId)` for org-owned lookups, and `idxList(map,key)` for FK groups. **Never mutate the array `idxList` returns** (shared bucket / frozen empty) — spread first. `findIndex` write-path sites stay as scans. Covered by `test/index.test.js` + `test/cost-optimizations.test.js`.
 - **Public-read caching (ADR-0012)**: user-agnostic GETs (opportunity list, leaderboard, stats) return via `jsonCacheable(req,res,data,key,maxAge)` — a cache-version-keyed weak ETag + short `Cache-Control` so browsers/CDNs revalidate with a 304. Only use it on responses that don't vary by user. Version-stamped static assets (`?v=`) are served immutable for a year.
 - **Audit log**: `appendAudit(actor,action,target,meta)` is hash-chained + tamper-evident; admin-only at `/api/admin/audit`. Add it to any new security-relevant action.
@@ -62,9 +64,9 @@ ServeLocal website/
 - **Passwords**: scrypt via `setPassword(user,pw)` / `verifyPassword(pw,user)` (never the old `hashPassword` for new creds — it's legacy/migration only). Legacy HMAC hashes auto-upgrade on login (`migrateLegacyPassword`). Block weak ones with `weakPassword()`. All secret comparisons use `crypto.timingSafeEqual`. Password change: `POST /api/account/password` (bumps `tokenVersion`).
 - **CORS**: `ALLOWED_ORIGINS` env locks down CORS in prod (default `*` in dev); `resolveCors(req)` sets `res._acao`, read by `json()`. Rate limits tunable via `RL_WRITE_CAP`/`RL_READ_CAP` etc. scrypt cost via `SCRYPT_N`.
 - **Two security items intentionally deferred** (documented in docs/security.md): HttpOnly-cookie auth refactor and TOTP MFA. Don't claim they're done.
-- **Tests**: `npm test` (node:test) — `test/unit|integration|regression`. `test/_boot.js` boots an isolated server on a temp DB via `DB_FILE`/`BACKUP_DIR` env. `npm run coverage:check` enforces the floor. `scripts/loadtest.js`, `scripts/chaos.js`, `scripts/backup.js`, `scripts/restore.js`. `npm run bench` (`scripts/bench.js`, `USERS=` to scale) micro-benchmarks the ADR-0012 scaling primitives (serialize / index rebuild / leaderboard / list) on a synthetic large DB — standalone, never touches `db.json`.
+- **Tests**: `npm test` (node:test) — `test/unit|integration|regression`. `test/_boot.js` boots an isolated server on a temp DB via `DB_FILE`/`BACKUP_DIR` env. `npm run coverage:check` enforces the floor. `scripts/loadtest.js`, `scripts/loadtest:scale` (real HTTP, large synthetic DB, `USERS=` to scale — see ADR-0013), `scripts/chaos.js`, `scripts/backup.js`, `scripts/restore.js`. `npm run bench` (`scripts/bench.js`, `USERS=` to scale) micro-benchmarks the ADR-0012 scaling primitives (serialize / index rebuild / leaderboard / list) on a synthetic large DB — standalone, never touches the real `db.sqlite`.
 - **Require-safe**: `server.js` only listens when run directly (`require.main===module`); exports `{router, buildServer, DB, helpers...}` for tests. Don't reintroduce top-level side effects.
-- **Secrets**: prod refuses to boot on the default `JWT_SECRET` **or** the default `ADMIN_PASSWORD` (the seeded admin password is public in source — set `ADMIN_PASSWORD` in prod). Credentials are only printed to the boot log in dev. Config in `.env` (see `.env.example`); never commit `.env`/`db.json`/`backups/`.
+- **Secrets**: prod refuses to boot on the default `JWT_SECRET` **or** the default `ADMIN_PASSWORD` (the seeded admin password is public in source — set `ADMIN_PASSWORD` in prod). Credentials are only printed to the boot log in dev. Config in `.env` (see `.env.example`); never commit `.env`/`db.sqlite`/`backups/`.
 
 ## Demo Credentials
 
@@ -77,7 +79,7 @@ All routes are in `server.js` as `if (method==='GET' && p==='/api/...')` blocks.
 
 ## Important Notes
 
-- `db.json` is the entire database — it resets to seed data if deleted
+- `db.sqlite` is the entire database — it resets to seed data if deleted
 - `expandRecurring()` in the frontend expands weekly/monthly apps into per-day calendar entries
 - Pass full app objects (not just `a.opp`) to `renderCal` so `type`, `singleDate`, `excludedDates` are preserved
 - Auto-logged hours use `autoKey` field (`auto:userId:oppId:dateStr`) for deduplication
@@ -114,4 +116,4 @@ how understanding evolved), not application/logistics tracking.
 - Convert relative dates ("yesterday", "last week") to absolute dates immediately — the record gets
   read months later when "yesterday" is meaningless.
 
-**Current files:** record = `docs/record_2026-07-02.md` · latest state = `docs/state_2026-07-03.md`.
+**Current files:** record = `docs/record_2026-07-02.md` · latest state = `docs/state_2026-07-04.md`.

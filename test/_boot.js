@@ -11,7 +11,7 @@ fs.mkdirSync(tmp, { recursive: true });
 process.env.NODE_ENV = 'test';
 process.env.JWT_SECRET = 'test-secret-' + crypto.randomBytes(8).toString('hex');
 process.env.ADMIN_PASSWORD = 'test-admin-' + crypto.randomBytes(8).toString('hex');
-process.env.DB_FILE = path.join(tmp, 'db.json');
+process.env.DB_FILE = path.join(tmp, 'db.sqlite');
 process.env.BACKUP_DIR = path.join(tmp, 'backups');
 process.env.SCRYPT_N = '8192'; // 2^13 — keep scrypt fast in CI while still exercising the path
 // Generous rate limits so multi-request test flows don't trip the shared-IP bucket.

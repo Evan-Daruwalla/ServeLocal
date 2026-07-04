@@ -12,7 +12,7 @@ npm test                    # unit + integration + regression
 npm run coverage:check      # enforce coverage floor
 npm run loadtest            # latency/throughput under load
 npm run chaos               # resilience checks
-npm run backup              # snapshot db.json
+npm run backup              # snapshot db.sqlite
 ```
 
 ## Definition of done (every PR)
@@ -24,7 +24,7 @@ npm run backup              # snapshot db.json
 4. Security-relevant actions call `appendAudit(actor, action, target, meta)`.
 5. New interactive UI is **keyboard-reachable and labelled** (see ADR-0007 / accessibility).
 6. Tests added: a regression test for any bug fix; integration coverage for new endpoints.
-7. No secrets, PII, or `db.json` committed (`.gitignore` enforces this).
+7. No secrets, PII, or `db.sqlite` committed (`.gitignore` enforces this).
 8. Docs/ADRs updated if architecture or a control changed.
 
 ## Code review standard

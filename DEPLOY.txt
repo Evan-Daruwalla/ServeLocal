@@ -24,10 +24,10 @@ API keys, or external services.
   3. Create a .gitignore BEFORE pushing:
 
        node_modules/
-       db.json
+       db.sqlite
        .env
 
-     db.json is your database — don't commit it to version control.
+     db.sqlite is your database — don't commit it to version control.
      .env contains secrets — never push it.
 
 
@@ -57,10 +57,11 @@ API keys, or external services.
   6. Railway gives you a URL like https://servelocal-production.up.railway.app
      Optionally add a custom domain in Settings > Networking > Custom Domain
 
-  IMPORTANT — db.json persistence:
+  IMPORTANT — db.sqlite persistence:
      Railway's filesystem is ephemeral (resets on redeploy). Options:
-       a) Use Railway's volume mount to persist /data
-       b) Migrate to a real database (SQLite file on a volume, or Postgres)
+       a) Use Railway's volume mount to persist /data (db.sqlite is now already a real
+          SQLite database, ADR-0013 — just needs to live on a persistent volume)
+       b) Migrate further to Postgres if write contention or dataset size ever demands it
        c) For MVP/demo: accept that data resets on redeploy, seed fresh
 
 
@@ -172,13 +173,13 @@ API keys, or external services.
   7. PRE-DEPLOY CHECKLIST
 ================================================================================
 
-  [ ] .gitignore includes: db.json, .env, node_modules/
+  [ ] .gitignore includes: db.sqlite, .env, node_modules/
   [ ] JWT_SECRET is a strong random value (not the default)
   [ ] RESEND_API_KEY is set and domain is verified in Resend
   [ ] FROM_EMAIL in server.js updated to your domain
   [ ] Test login, signup, and email verification on the live URL
   [ ] Test calendar subscription with webcal:// on the live URL
-  [ ] Set up Railway volume or database for db.json persistence
+  [ ] Set up Railway volume for db.sqlite persistence
   [ ] (Optional) Configure custom domain + DNS
 
 
@@ -223,7 +224,7 @@ API keys, or external services.
   6. Remove the "demo mode" copy in public/index.html (pricing page, donate
      page, upgrade dialog).
 
-  Until then, demo upgrades/donations are flagged with demo:true in db.json.
+  Until then, demo upgrades/donations are flagged with demo:true in the DB (db.sqlite).
 
 
 ================================================================================

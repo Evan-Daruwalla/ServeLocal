@@ -13,6 +13,9 @@
 // real end-to-end HTTP, but not a distributed benchmark.
 const { spawn } = require('node:child_process');
 const os = require('node:os'); const path = require('node:path'); const fs = require('node:fs'); const crypto = require('node:crypto');
+const Database = require('better-sqlite3');
+const DB_COLLECTIONS = ['users','opportunities','hours','applications','messages','reviews','reports','verificationTokens','notifications','endorsements','donations','auditLog'];
+const _pk = k => (k === 'auditLog' ? 'seq' : 'id');
 
 const USERS = Number(process.env.USERS) || 10000;
 const TOTAL = Number(process.argv[2]) || 3000;
@@ -42,19 +45,30 @@ function buildDB() {
 (async () => {
   const tmp = path.join(os.tmpdir(), 'servelocal-scale-' + crypto.randomBytes(5).toString('hex'));
   fs.mkdirSync(tmp, { recursive: true });
-  const dbFile = path.join(tmp, 'db.json');
+  const dbFile = path.join(tmp, 'db.sqlite');
 
   console.log(`Building ${USERS.toLocaleString()}-user corpus…`);
   const DB = buildDB();
   let mb;
   try {
-    fs.writeFileSync(dbFile, JSON.stringify(DB)); // may exceed V8's ~512MB max string length
+    // Per-row inserts (ADR-0013), not one JSON.stringify(DB) call — this is the
+    // thing that used to throw "Invalid string length" past ~90k users (ADR-0012).
+    const db = new Database(dbFile);
+    DB_COLLECTIONS.forEach(k => {
+      const pk = _pk(k);
+      db.exec(`CREATE TABLE IF NOT EXISTS "${k}" (${pk} ${pk === 'seq' ? 'INTEGER' : 'TEXT'} PRIMARY KEY, data TEXT NOT NULL)`);
+    });
+    db.transaction(() => {
+      DB_COLLECTIONS.forEach(k => {
+        const pk = _pk(k);
+        const insert = db.prepare(`INSERT INTO "${k}" (${pk}, data) VALUES (?, ?)`);
+        for (const row of (DB[k] || [])) insert.run(row[pk], JSON.stringify(row));
+      });
+    })();
+    db.close();
     mb = fs.statSync(dbFile).size / 1e6;
   } catch (e) {
-    console.error('\n*** Could not serialise the DB at ' + USERS.toLocaleString() + ' users: ' + e.message);
-    console.error('This is the ADR-0002 / ADR-0012 ceiling: the whole DB is one JSON string, and V8 caps');
-    console.error('a string at ~512 MB (~0.5 GB). Beyond that the app cannot even write OR load db.json —');
-    console.error('the file-JSON store must become an on-disk DB (node:sqlite) first. See docs/adr/0012.');
+    console.error('\n*** Could not build the DB at ' + USERS.toLocaleString() + ' users: ' + e.message);
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* noop */ }
     process.exit(2);
   }
@@ -70,7 +84,7 @@ function buildDB() {
   const deadline = Date.now() + 30000;
   let ready = false;
   while (Date.now() < deadline) { try { const r = await fetch(base + '/api/health'); if (r.ok) { ready = true; break; } } catch { /* retry */ } await new Promise(r => setTimeout(r, 250)); }
-  if (!ready) { console.error('Server did not become ready (a >512 MB DB fails to load — see ADR-0012).'); kill(); process.exit(2); }
+  if (!ready) { console.error('Server did not become ready within 30s.'); kill(); process.exit(2); }
 
   for (const e of ENDPOINTS) { try { await fetch(base + e); } catch { /* warm */ } } // warm indexes/caches
 

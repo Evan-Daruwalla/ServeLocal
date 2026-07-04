@@ -17,12 +17,14 @@
     "backup": "node scripts/backup.js",
     "restore": "node scripts/restore.js",
     "migrate:guardian-consent": "node scripts/migrate-guardian-consent.js",
+    "migrate:sqlite": "node scripts/migrate-to-sqlite.js",
     "lint": "node -e \"require('child_process').execSync('node --check server.js',{stdio:'inherit'})\""
   },
   "engines": {
     "node": ">=18.0.0"
   },
-  "dependencies": {},
-  "devDependencies": {},
+  "dependencies": {
+    "better-sqlite3": "^12.11.1"
+  },
   "license": "UNLICENSED"
 }

@@ -9,6 +9,7 @@ const fs   = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const url  = require('url');
+const Database = require('better-sqlite3');
 
 // ── LOAD .env FILE ────────────────────────────────
 // Looks for .env in the same folder as server.js
@@ -33,7 +34,7 @@ if (fs.existsSync(ENV_FILE)) {
 const NODE_ENV   = process.env.NODE_ENV || 'development';
 const IS_PROD    = NODE_ENV === 'production';
 const PORT       = process.env.PORT || 3000;
-const DB_FILE    = process.env.DB_FILE || path.join(__dirname, 'db.json');
+const DB_FILE    = process.env.DB_FILE || path.join(__dirname, 'db.sqlite');
 const BACKUP_DIR = process.env.BACKUP_DIR || path.join(__dirname, 'backups');
 const DEFAULT_SECRET = 'servelocal-v2-secret-CHANGE-IN-PROD';
 const SECRET     = process.env.JWT_SECRET || DEFAULT_SECRET;
@@ -296,17 +297,62 @@ let DB = Object.fromEntries(DB_COLLECTIONS.map(k => [k, []]));
 let _dbHealthy = true;   // flips false if a save fails — surfaced at /api/health/ready
 let _lastSaveFailure = null;
 
+// SQLite persistence (ADR-0013): each collection is its own table (a primary
+// key column + a JSON `data` column per row). This is a persistence-layer swap
+// ONLY — every DB.<collection> in-memory array and the whole IDX() layer above
+// are untouched; every request still reads/writes plain JS objects exactly as
+// before. The fix targets the one thing ADR-0012 confirmed actually breaks the
+// app at scale: JSON.stringify(DB) building a SINGLE JS string that hits V8's
+// ~512MB string-length cap (~90k users). Serialising per row means no single
+// string ever approaches that limit, however large the DB grows in aggregate.
+const _pk = k => (k === 'auditLog' ? 'seq' : 'id');
+function _openSqlite(file) {
+  const db = new Database(file);
+  try {
+    DB_COLLECTIONS.forEach(k => {
+      const pk = _pk(k);
+      db.exec(`CREATE TABLE IF NOT EXISTS "${k}" (${pk} ${pk === 'seq' ? 'INTEGER' : 'TEXT'} PRIMARY KEY, data TEXT NOT NULL)`);
+    });
+  } catch (e) {
+    // A corrupt/non-sqlite file throws here (on the first schema touch, not the
+    // constructor) — close the handle before rethrowing so Windows releases its
+    // lock immediately. Without this, the caller's recovery rename over this same
+    // path fails with EPERM (found via the chaos harness's corrupt-DB scenario).
+    db.close();
+    throw e;
+  }
+  return db;
+}
+function _readAllFromSqlite(db) {
+  const out = {};
+  DB_COLLECTIONS.forEach(k => {
+    out[k] = db.prepare(`SELECT data FROM "${k}" ORDER BY ${_pk(k)}`).all().map(r => JSON.parse(r.data));
+  });
+  return out;
+}
+function _writeAllToSqlite(db, data) {
+  db.transaction(() => {
+    DB_COLLECTIONS.forEach(k => {
+      const pk = _pk(k);
+      db.prepare(`DELETE FROM "${k}"`).run();
+      const insert = db.prepare(`INSERT INTO "${k}" (${pk}, data) VALUES (?, ?)`);
+      for (const row of data[k]) insert.run(row[pk], JSON.stringify(row));
+    });
+  })();
+}
+
 function loadDB() {
   try {
     if (fs.existsSync(DB_FILE)) {
-      DB = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-      DB_COLLECTIONS.forEach(k => { if (!DB[k]) DB[k] = []; });
+      const db = _openSqlite(DB_FILE);
+      DB = _readAllFromSqlite(db);
+      db.close();
       console.log('📂 Database loaded');
     } else {
       seedDB();
     }
   } catch(e) {
-    // Graceful degradation: a corrupt db.json must not take the service down.
+    // Graceful degradation: a corrupt db.sqlite must not take the service down.
     console.error('DB load error:', e.message, '— attempting newest backup, else reseeding');
     // Persist the recovered state back to the primary file so disk is healthy
     // again immediately (not left corrupt until the next write). seedDB() already saves.
@@ -315,16 +361,20 @@ function loadDB() {
   }
 }
 
-// Atomic write: serialise to a temp file then rename (rename is atomic on the
-// same volume on both POSIX and Windows), so a crash mid-write can never leave
-// a half-written db.json. A failed save degrades gracefully — we keep serving
-// from memory and flag readiness rather than crashing.
+// Atomic write: build a fresh sqlite file at a temp path, close it, then rename
+// over the primary file (rename is atomic on the same volume on both POSIX and
+// Windows), so a crash mid-write can never leave a half-written db.sqlite. A
+// failed save degrades gracefully — we keep serving from memory and flag
+// readiness rather than crashing.
 function saveDB() {
   // An explicit save persists everything, so cancel any pending coalesced flush.
   _saveDirty = false; if (_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null; }
   try {
     const tmp = DB_FILE + '.' + process.pid + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(DB, null, 2));
+    if (fs.existsSync(tmp)) fs.rmSync(tmp);
+    const db = _openSqlite(tmp);
+    _writeAllToSqlite(db, DB);
+    db.close();
     fs.renameSync(tmp, DB_FILE);
     _dbHealthy = true; _lastSaveFailure = null;
     bumpCache(); // any write invalidates read caches
@@ -355,10 +405,10 @@ function backupSnapshot() {
     if (!fs.existsSync(DB_FILE)) return null;
     if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const dest = path.join(BACKUP_DIR, `db-${stamp}.json`);
+    const dest = path.join(BACKUP_DIR, `db-${stamp}.sqlite`);
     fs.copyFileSync(DB_FILE, dest);
     // Retain the most recent 48 snapshots (~24h at 30-min cadence)
-    const snaps = fs.readdirSync(BACKUP_DIR).filter(f => f.startsWith('db-') && f.endsWith('.json')).sort();
+    const snaps = fs.readdirSync(BACKUP_DIR).filter(f => f.startsWith('db-') && f.endsWith('.sqlite')).sort();
     while (snaps.length > 48) fs.unlinkSync(path.join(BACKUP_DIR, snaps.shift()));
     return dest;
   } catch (e) { console.error('Backup failed:', e.message); return null; }
@@ -366,12 +416,13 @@ function backupSnapshot() {
 function restoreFromBackup() {
   try {
     if (!fs.existsSync(BACKUP_DIR)) return false;
-    const snaps = fs.readdirSync(BACKUP_DIR).filter(f => f.startsWith('db-') && f.endsWith('.json')).sort();
+    const snaps = fs.readdirSync(BACKUP_DIR).filter(f => f.startsWith('db-') && f.endsWith('.sqlite')).sort();
     while (snaps.length) {
       const latest = snaps.pop();
       try {
-        const data = JSON.parse(fs.readFileSync(path.join(BACKUP_DIR, latest), 'utf8'));
-        DB = data; DB_COLLECTIONS.forEach(k => { if (!DB[k]) DB[k] = []; });
+        const db = _openSqlite(path.join(BACKUP_DIR, latest));
+        DB = _readAllFromSqlite(db);
+        db.close();
         console.log('♻️  Restored database from backup', latest);
         return true;
       } catch { /* try the next-older snapshot */ }
@@ -782,14 +833,14 @@ function json(res,data,status=200,extraHeaders={}) {
 // CDN revalidate with a 304 (no body, no re-serialise) instead of re-fetching. Any write
 // bumps _cacheVersion, so the ETag changes immediately and staleness is bounded by max-age.
 // Only use on responses that do NOT vary by user — never on authenticated/owner-specific data.
-function jsonCacheable(req, res, data, key, maxAge = 30) {
+function jsonCacheable(req, res, data, key, maxAge = 30, extraHeaders = {}) {
   const etag = 'W/"' + crypto.createHash('sha1').update(_cacheVersion + '|' + key).digest('hex').slice(0, 16) + '"';
   const cc = 'public, max-age=' + maxAge;
   if (req.headers['if-none-match'] === etag) {
-    res.writeHead(304, { ETag: etag, 'Cache-Control': cc, ...securityHeaders() });
+    res.writeHead(304, { ETag: etag, 'Cache-Control': cc, ...extraHeaders, ...securityHeaders() });
     return res.end();
   }
-  return json(res, data, 200, { 'Cache-Control': cc, ETag: etag });
+  return json(res, data, 200, { 'Cache-Control': cc, ETag: etag, ...extraHeaders });
 }
 function serveStatic(res,filePath,req) {
   if (res.headersSent) return;
@@ -1244,6 +1295,18 @@ async function router(req, res) {
       }).filter(o=>o.distanceMiles===null||o.distanceMiles<=radiusMiles)
         .sort((a,b)=>(a.distanceMiles??999)-(b.distanceMiles??999));
     }
+    // Featured (Pro) listings pin to the top; stable sort preserves distance order within groups
+    opps.sort((a,b)=>(b.featured?1:0)-(a.featured?1:0));
+    // Pagination (ADR-0013): the full filtered/sorted list can run to thousands of rows at
+    // scale (~0.5MB/response at 10k users, per the ADR-0012 load test) — bound the response
+    // to one page, computed AFTER sort so featured items across the whole result set still
+    // win a top slot, and BEFORE the per-listing badge computation below so we don't do that
+    // work for rows we're not returning. Total count travels in X-Total-Count for callers
+    // that want to page further; unspecified limit/offset behave like page 1 of a default page.
+    const total = opps.length;
+    const limit = Math.min(Math.max(parseInt(parsed.query.limit, 10) || 60, 1), 200);
+    const offset = Math.max(parseInt(parsed.query.offset, 10) || 0, 0);
+    opps = opps.slice(offset, offset + limit);
     const idx = IDX();
     opps = opps.map(o=>{
       // Indexed lookups (appsByOpp/oppsByOrg) collapse what used to be an N+1 scan of the
@@ -1261,10 +1324,8 @@ async function router(req, res) {
       if (org?.createdAt&&(Date.now()-new Date(org.createdAt))>180*864e5&&org.adminApproved) badges.push('established');
       return {...publicOpp(o), applicantCount:ac, badges};
     });
-    // Featured (Pro) listings pin to the top; stable sort preserves distance order within groups
-    opps.sort((a,b)=>(b.featured?1:0)-(a.featured?1:0));
     // Public, user-agnostic list -> allow short-lived browser/CDN caching + 304 revalidation.
-    return jsonCacheable(req, res, opps, 'opps|' + (parsed.search || ''), 15);
+    return jsonCacheable(req, res, opps, 'opps|' + (parsed.search || '') + '|' + limit + '|' + offset, 15, { 'X-Total-Count': String(total) });
   }
 
   // GET /api/opportunities/:id/date-spots  →  per-occurrence spot counts for recurring events

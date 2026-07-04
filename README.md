@@ -14,12 +14,13 @@ Server runs on `http://localhost:3000` (or the `PORT` env var).
 
 ## Architecture
 
-- **Zero dependencies** — pure Node.js `http` module, no npm packages, no
-  frameworks.
+- **Near-zero dependencies** — pure Node.js `http` module, no frameworks. One
+  runtime dependency (`better-sqlite3`, ADR-0013), a documented exception to
+  the zero-dep default (ADR-0001).
 - **Single-page app** — the entire frontend (HTML + CSS + JS) lives in
   `public/index.html`.
-- **File-based DB** — `db.json` in the project root, auto-created on first
-  run, with periodic snapshot backups.
+- **SQLite-backed DB** — `db.sqlite` in the project root, auto-created on
+  first run, with periodic snapshot backups.
 - **Server** — `server.js` handles all API routes, auth, and static file
   serving; routes are hand-written `if (method===... && p===...)` blocks,
   no router library.
