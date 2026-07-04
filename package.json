@@ -11,6 +11,7 @@
     "coverage:check": "node --test --experimental-test-coverage --test-coverage-lines=50 --test-coverage-branches=70 --test-coverage-functions=30",
     "audit": "npm audit --audit-level=high",
     "loadtest": "node scripts/loadtest.js",
+    "bench": "node scripts/bench.js",
     "chaos": "node scripts/chaos.js",
     "backup": "node scripts/backup.js",
     "restore": "node scripts/restore.js",

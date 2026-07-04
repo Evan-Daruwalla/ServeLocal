@@ -60,3 +60,27 @@ Targeted, backward-compatible changes — no new dependency, no change to the st
   critical and are *not* truncated — bounding those means archival-with-chain-preservation, a
   separate decision. The JSON-whole-DB write model (ADR-0002) remains the real ceiling; `node:sqlite`
   is the first thing to weigh before genuine scale.
+
+## Measured impact
+Reproduce with `npm run bench` (`scripts/bench.js` — synthetic corpus, `USERS=` to scale). Numbers
+below are the median on a dev machine at a **10,000-user / 76.7 MB** database (10k users · 80k
+applications · 120k hours · 150k notifications):
+
+| Operation | Before | After | Speedup |
+|---|---:|---:|---:|
+| `saveDB()` serialize + atomic write | ~275 ms (blocks the event loop) | coalesced to ~0 per view | — |
+| full index rebuild | ~50 ms on *every* write | only on structural writes | — |
+| leaderboard (uncached) | ~11,800 ms | ~5 ms | ~2300× |
+| opportunity list (200 listings) | ~370 ms | ~1 ms | ~400× |
+
+The point is **availability, not just latency**: the server is single-threaded, so each figure above
+is time the whole process serves *no one else*. At 10k users the old leaderboard alone (~11.8 s of
+blocking CPU, and — via a `cacheGet` with no matching `cacheSet` — recomputed on *every* request)
+would repeatedly freeze the event loop. Several operations went from "takes the server down at 10k
+users" to sub-10 ms.
+
+A **modeled** daily aggregate — assuming ~2,000 daily-active users, 40k opp-views, 10k list loads,
+2k leaderboard loads/day — comes to roughly **10–11 hours/day of blocking server CPU removed**, but
+that figure is dominated by the leaderboard (partly a bug fix) and swings with the traffic
+assumptions. The per-operation numbers are the solid part; the per-day figure is an estimate, not a
+load test (`npm run loadtest` is the tool for a real end-to-end number).
