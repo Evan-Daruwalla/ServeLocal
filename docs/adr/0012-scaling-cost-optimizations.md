@@ -82,5 +82,35 @@ users" to sub-10 ms.
 A **modeled** daily aggregate — assuming ~2,000 daily-active users, 40k opp-views, 10k list loads,
 2k leaderboard loads/day — comes to roughly **10–11 hours/day of blocking server CPU removed**, but
 that figure is dominated by the leaderboard (partly a bug fix) and swings with the traffic
-assumptions. The per-operation numbers are the solid part; the per-day figure is an estimate, not a
-load test (`npm run loadtest` is the tool for a real end-to-end number).
+assumptions. The per-operation numbers are the solid part; the per-day figure is an estimate.
+
+### End-to-end HTTP, before vs after (real, not modeled)
+Measured with `npm run loadtest:scale` (`scripts/loadtest-scale.js` — spawns the real server against
+a synthetic large DB with the per-IP limiter lifted so it measures the endpoints, not the limiter).
+Single-shot latency on the same **10k-user / 59 MB** DB, pre-optimization (commit `10b0d05`) vs current:
+
+| Endpoint | Before | After | Speedup |
+|---|---:|---:|---:|
+| `/api/leaderboard` | **17,293 ms** | **0.3 ms** | ~50,000× |
+| `/api/opportunities` | **4,907 ms** | **38 ms** | ~130× |
+| `/api/stats` | 6.2 ms | 0.4 ms | ~15× |
+
+Under load (current code, 3,000 reqs @ concurrency 50, limiter lifted): **~80 req/s, p50 ~620 ms,
+p99 ~820 ms, 0 errors**. The old code would deadlock here — one 17 s leaderboard request freezes the
+single-threaded event loop for *every* concurrent client, so with ⅓ of traffic on that endpoint
+throughput collapses toward zero. This is the empirical confirmation of the "availability, not
+latency" point.
+
+**Honest finding surfaced by the load test:** with compute fixed, `/api/opportunities` is now
+**response-size-bound** — it returns *all* active listings uncached (~0.5 MB/response; the run moved
+1.5 GB of body), which is what caps throughput at ~80 req/s. Pagination (built but optional) and the
+ETag/304 path (helps real browsers, not this header-less driver) are the next levers — not more
+indexing.
+
+**Ceiling (confirmed empirically):** the whole DB is one JSON string, and V8 caps a string at
+~512 MB (2^29 chars). At this record shape 10k users ≈ 59 MB, so the crossover is **~90k users** —
+and `USERS=100000 npm run loadtest:scale` fails outright with `Invalid string length` while writing
+`db.json` (it can neither be written nor, therefore, `JSON.parse`d back on boot). That is the hard
+wall behind "the JSON-whole-DB model is the real ceiling": past ~90k users the app does not start,
+full stop, and no amount of the read-path optimization above helps. Moving persistence to
+`node:sqlite` (on-disk, indexed, no whole-DB string) is the prerequisite to scale past it.
