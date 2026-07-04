@@ -14,3 +14,4 @@ Consequences. Add a new numbered file (don't edit accepted ones; supersede inste
 - [0009 — scrypt password hashing with transparent migration](./0009-scrypt-password-hashing.md)
 - [0010 — Guardian consent is a precondition, not a feature](./0010-guardian-consent-precondition.md)
 - [0011 — In-memory indexes over the JSON store](./0011-in-memory-indexes.md)
+- [0012 — Server-cost optimizations for large user counts](./0012-scaling-cost-optimizations.md)

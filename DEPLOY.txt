@@ -227,3 +227,28 @@ API keys, or external services.
 
 
 ================================================================================
+  10. STATIC ASSETS / CDN (cost at scale — ADR-0012)
+================================================================================
+
+  The Node process currently serves everything, including the ~3.8k emoji PNGs
+  in public/emoji/ and the brand assets. Those are already sent with correct
+  long-lived cache headers:
+    - public/emoji/*            -> Cache-Control: public, max-age=1yr, immutable
+    - version-stamped assets    -> same (any URL with a ?v= cache-buster, e.g.
+      /favicon-32.png?v=3, /og-image.png?v=3 as referenced in index.html head)
+    - other static (no ?v=)     -> public, max-age=1h
+    - index.html                -> no-cache (so deploys show immediately)
+
+  AT SCALE: put a CDN / reverse proxy (Cloudflare, Fastly, nginx) in front of
+  the app and let it serve /public (especially /emoji) directly. Because the
+  cache headers above are already correct, this is CONFIG-ONLY — no code change.
+  It moves the bulk of requests (static images) off the Node event loop and onto
+  edge bandwidth, which is the single biggest static-traffic cost win.
+
+  Public API reads (opportunity list, /api/leaderboard, /api/stats) also send a
+  cache-version-keyed ETag + short Cache-Control (see jsonCacheable / ADR-0012),
+  so a CDN can cache and 304-revalidate them too. Do NOT cache authenticated or
+  user-specific responses at the CDN — those stay Cache-Control: no-store.
+
+
+================================================================================

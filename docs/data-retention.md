@@ -8,6 +8,7 @@ user-initiated deletion. The goal is to hold personal and derived data no longer
 | Account + profile (PII) | Until the user deletes the account | `DELETE /api/account` (right to erasure) |
 | Read notifications | 90 days | `retentionPurge()` deletes read notifications older than 90d |
 | Unread notifications | Kept until read, then 90 days | same |
+| Notifications per user | Most recent 200 (`MAX_NOTIF_PER_USER`) | `retentionPurge()` caps each user's notifications to bound growth (ADR-0012) |
 | Resolved reports | 1 year | `retentionPurge()` |
 | Open reports | Until resolved | — |
 | Event check-in codes | Expire after 12h; purged ~24h after expiry | `retentionPurge()` |

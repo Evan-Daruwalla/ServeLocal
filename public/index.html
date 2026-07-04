@@ -2013,11 +2013,20 @@ async function resendGuardianConsent() {
 }
 
 // ── NOTIFICATIONS ───────────────────────────
-let _notifInterval = null;
+let _notifInterval = null, _notifVisBound = false;
 function startNotifPolling() {
   stopNotifPolling();
   pollNotifCount();
   _notifInterval = setInterval(pollNotifCount, 30000);
+  // Pause polling while the tab is hidden and catch up the moment it's foregrounded again.
+  // A backgrounded tab shouldn't keep hitting the server every 30s (saves request volume at
+  // scale); pollNotifCount() already no-ops on document.hidden, this just refreshes on return.
+  if (!_notifVisBound) {
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') pollNotifCount();
+    });
+    _notifVisBound = true;
+  }
 }
 function stopNotifPolling() {
   if (_notifInterval) { clearInterval(_notifInterval); _notifInterval=null; }
@@ -2026,6 +2035,7 @@ function stopNotifPolling() {
 }
 async function pollNotifCount() {
   if (!currentUser) return;
+  if (document.hidden) return; // skip network/server work while tab is backgrounded
   try {
     const d = await api('/api/notifications/unread-count');
     const badge = document.getElementById('notif-badge');

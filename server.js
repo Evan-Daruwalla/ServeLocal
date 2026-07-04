@@ -154,7 +154,20 @@ function bumpCache() { _cacheVersion++; if (_cache.size > 500) _cache.clear(); }
 // `_cacheVersion` — the same coarse invalidation the read cache uses, so an index
 // can never return state older than the last save. Read only via IDX(); never hold
 // the returned object across a write (it may be rebuilt underneath you).
-let _idx = null, _idxVersion = -1, _idxDbRef = null;
+let _idx = null, _idxSig = '', _idxDbRef = null;
+// Collections the indexes are built from. The rebuild trigger below keys off *these*
+// lengths only — an append to a non-indexed collection (e.g. auditLog on every audited
+// action) must NOT force an index rebuild.
+const _IDX_COLLECTIONS = ['users','opportunities','applications','hours','notifications','messages','reviews','endorsements'];
+// Structural signature (ADR-0012). The indexes are Maps of object *references* grouped by
+// id / foreign key. A field mutation (status, read, views, verified…) keeps every reference
+// and every grouping valid, so it needs no rebuild — only a *structural* change (a row added
+// or removed, or a collection array swapped) can invalidate them, and every such change alters
+// an indexed collection's length. This holds because the codebase never reassigns an id/FK in
+// place and never replaces an array element in place (deletes are length-shrinking filters).
+// So a per-collection length signature is a sufficient, self-maintaining rebuild trigger —
+// far cheaper than the old "rebuild on every write" (which fired on field-only writes too).
+function idxSignature() { let s = ''; for (const k of _IDX_COLLECTIONS) s += (DB[k] ? DB[k].length : 0) + ','; return s; }
 function buildIndexes() {
   const byId = arr => { const m = new Map(); for (const x of arr) m.set(x.id, x); return m; };
   // Group into Map<key, item[]>; skips null/undefined keys so a missing FK doesn't bucket.
@@ -177,11 +190,11 @@ function buildIndexes() {
     oppsByOrg: group(DB.opportunities, 'orgId'),
     endorsementsByUser: group(DB.endorsements, 'userId'),
   };
-  _idxVersion = _cacheVersion;
+  _idxSig = idxSignature();
   _idxDbRef = DB;
 }
 function IDX() {
-  if (_idx === null || _idxDbRef !== DB || _idxVersion !== _cacheVersion) buildIndexes();
+  if (_idx === null || _idxDbRef !== DB || _idxSig !== idxSignature()) buildIndexes();
   return _idx;
 }
 // Convenience: foreign-key groups return a shared [] when empty so callers can
@@ -307,6 +320,8 @@ function loadDB() {
 // a half-written db.json. A failed save degrades gracefully — we keep serving
 // from memory and flag readiness rather than crashing.
 function saveDB() {
+  // An explicit save persists everything, so cancel any pending coalesced flush.
+  _saveDirty = false; if (_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null; }
   try {
     const tmp = DB_FILE + '.' + process.pid + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(DB, null, 2));
@@ -317,6 +332,21 @@ function saveDB() {
     _dbHealthy = false; _lastSaveFailure = e.message;
     console.error('DB save FAILED (serving from memory):', e.message);
   }
+}
+
+// Coalesced save for high-frequency, low-criticality writes (view counts, notification
+// read-flags). Mark dirty and flush on a short debounce so a burst of writes collapses
+// into ONE disk serialise instead of one per write. Any explicit saveDB() — including the
+// graceful-shutdown flush — persists the pending state too, so nothing is silently dropped
+// beyond an at-most-one-debounce-window loss of a view tick on a hard crash (acceptable for
+// a page-view counter). See ADR-0012.
+let _saveDirty = false, _saveTimer = null;
+const SAVE_DEBOUNCE_MS = Number(process.env.SAVE_DEBOUNCE_MS) || 2000;
+function saveDBSoon() {
+  _saveDirty = true;
+  if (_saveTimer) return;
+  _saveTimer = setTimeout(() => { _saveTimer = null; if (_saveDirty) saveDB(); }, SAVE_DEBOUNCE_MS);
+  _saveTimer.unref?.();
 }
 
 // ── BACKUPS (RPO) + RESTORE (RTO) ─────────────
@@ -746,6 +776,21 @@ function json(res,data,status=200,extraHeaders={}) {
   });
   res.end(body);
 }
+
+// Conditional-GET for public, user-agnostic reads (opportunity list, leaderboard, stats).
+// A weak ETag derived from the global cache version + a per-request key lets browsers and a
+// CDN revalidate with a 304 (no body, no re-serialise) instead of re-fetching. Any write
+// bumps _cacheVersion, so the ETag changes immediately and staleness is bounded by max-age.
+// Only use on responses that do NOT vary by user — never on authenticated/owner-specific data.
+function jsonCacheable(req, res, data, key, maxAge = 30) {
+  const etag = 'W/"' + crypto.createHash('sha1').update(_cacheVersion + '|' + key).digest('hex').slice(0, 16) + '"';
+  const cc = 'public, max-age=' + maxAge;
+  if (req.headers['if-none-match'] === etag) {
+    res.writeHead(304, { ETag: etag, 'Cache-Control': cc, ...securityHeaders() });
+    return res.end();
+  }
+  return json(res, data, 200, { 'Cache-Control': cc, ETag: etag });
+}
 function serveStatic(res,filePath,req) {
   if (res.headersSent) return;
   // Containment: resolve the request to an absolute path and require it to stay
@@ -764,9 +809,13 @@ function serveStatic(res,filePath,req) {
       const st = fs.statSync(fp);
       const etag = '"' + st.size.toString(16) + '-' + st.mtimeMs.toString(16) + '"';
       // HTML must always revalidate so deploys show immediately. Emoji are
-      // content-addressed by codepoint (immutable) -> cache for a year; other
-      // assets cache 1h.
-      const immutable = fp.startsWith(path.join(PUBLIC, 'emoji') + path.sep);
+      // content-addressed by codepoint (immutable) -> cache for a year; assets
+      // requested with a `?v=` cache-buster (brand PNGs in the SPA head) are
+      // effectively immutable for that version -> cache a year too; everything
+      // else caches 1h. Long-lived, revalidation-free caching is what lets a CDN
+      // / reverse proxy serve the bulk of static traffic off the app server.
+      const versioned = req && /[?&]v=/.test(req.url || '');
+      const immutable = versioned || fp.startsWith(path.join(PUBLIC, 'emoji') + path.sep);
       const cacheCtl = ext === '.html' ? 'no-cache'
         : immutable ? 'public, max-age=31536000, immutable'
         : 'public, max-age=3600';
@@ -1195,23 +1244,27 @@ async function router(req, res) {
       }).filter(o=>o.distanceMiles===null||o.distanceMiles<=radiusMiles)
         .sort((a,b)=>(a.distanceMiles??999)-(b.distanceMiles??999));
     }
+    const idx = IDX();
     opps = opps.map(o=>{
-      const ac = DB.applications.filter(a=>a.oppId===o.id&&a.status==='approved').length;
+      // Indexed lookups (appsByOpp/oppsByOrg) collapse what used to be an N+1 scan of the
+      // whole applications+opportunities arrays per listing into O(1) group reads (ADR-0012).
+      const ac = idxList(idx.appsByOpp, o.id).filter(a=>a.status==='approved').length;
       // Compute org badges
-      const org = IDX().userByOrgId.get(o.orgId);
+      const org = idx.userByOrgId.get(o.orgId);
       const badges = [];
       if (org?.adminApproved) badges.push('verified');
-      const orgReviews = idxList(IDX().reviewsByOrg,o.orgId);
+      const orgReviews = idxList(idx.reviewsByOrg,o.orgId);
       if (orgReviews.length>=3) { const avg=orgReviews.reduce((s,r)=>s+r.rating,0)/orgReviews.length; if(avg>=4.5) badges.push('top-rated'); }
-      const orgOppIds = DB.opportunities.filter(x=>x.orgId===o.orgId).map(x=>x.id);
-      const resolved = DB.applications.filter(a=>orgOppIds.includes(a.oppId)&&a.resolvedAt).slice(-10);
+      const orgOpps = idxList(idx.oppsByOrg, o.orgId);
+      const resolved = orgOpps.flatMap(op=>idxList(idx.appsByOpp, op.id)).filter(a=>a.resolvedAt).slice(-10);
       if (resolved.length>=3) { const avg=resolved.reduce((s,a)=>s+(new Date(a.resolvedAt)-new Date(a.createdAt))/36e5,0)/resolved.length; if(avg<=24) badges.push('responsive'); }
       if (org?.createdAt&&(Date.now()-new Date(org.createdAt))>180*864e5&&org.adminApproved) badges.push('established');
       return {...publicOpp(o), applicantCount:ac, badges};
     });
     // Featured (Pro) listings pin to the top; stable sort preserves distance order within groups
     opps.sort((a,b)=>(b.featured?1:0)-(a.featured?1:0));
-    return json(res,opps);
+    // Public, user-agnostic list -> allow short-lived browser/CDN caching + 304 revalidation.
+    return jsonCacheable(req, res, opps, 'opps|' + (parsed.search || ''), 15);
   }
 
   // GET /api/opportunities/:id/date-spots  →  per-occurrence spot counts for recurring events
@@ -2055,14 +2108,14 @@ async function router(req, res) {
   // STATS (public)
   // ══════════════════════════════════════════
   if (method==='GET' && p==='/api/stats') {
-    const cached = cacheGet('stats');
-    if (cached) return json(res, cached);
-    return json(res, cacheSet('stats', {
+    let stats = cacheGet('stats');
+    if (!stats) stats = cacheSet('stats', {
       opportunities: DB.opportunities.filter(o=>o.active).length,
       students: DB.users.filter(u=>u.role==='student').length,
       totalHours: Math.round(DB.hours.filter(h=>h.status==='verified').reduce((s,h)=>s+h.hours,0)*100)/100,
       organisations: DB.users.filter(u=>u.role==='org'&&u.adminApproved).length,
-    }, 15000));
+    }, 15000);
+    return jsonCacheable(req, res, stats, 'stats', 30);
   }
 
   // CALENDAR FEED (.ics)
@@ -2155,13 +2208,13 @@ async function router(req, res) {
     const n = DB.notifications.find(n=>n.id===notifRead[1]&&n.userId===user.id);
     if (!n) return json(res,{error:'Not found'},404);
     n.read = true;
-    saveDB();
+    saveDBSoon(); // read-flag is low-value; coalesce the write (ADR-0012)
     return json(res,n);
   }
   if (method==='PATCH' && p==='/api/notifications/read-all') {
     if (!user) return json(res,{error:'Unauthorized'},401);
     idxList(IDX().notifsByUser,user.id).filter(n=>!n.read).forEach(n=>n.read=true);
-    saveDB();
+    saveDBSoon(); // read-flags are low-value; coalesce the write (ADR-0012)
     return json(res,{ok:true});
   }
 
@@ -2409,7 +2462,9 @@ async function router(req, res) {
   const viewMatch = p.match(/^\/api\/opportunities\/([^/]+)\/view$/);
   if (method==='POST' && viewMatch) {
     const opp = IDX().oppById.get(viewMatch[1]);
-    if (opp) { opp.views = (opp.views||0)+1; saveDB(); }
+    // Increment in memory (analytics reads it live) but coalesce the disk write —
+    // a page view must not trigger a full-DB serialise (ADR-0012).
+    if (opp) { opp.views = (opp.views||0)+1; saveDBSoon(); }
     return json(res,{ok:true});
   }
 
@@ -2598,37 +2653,43 @@ async function router(req, res) {
   // COMMUNITY LEADERBOARD (public — first name + last initial only)
   // ══════════════════════════════════════════
   if (method==='GET' && p==='/api/leaderboard') {
-    const lbCached = cacheGet('leaderboard');
-    if (lbCached) return json(res, lbCached);
-    const students = DB.users.filter(u=>u.role==='student');
-    const topVolunteers = students.map(s=>{
-      const vh = DB.hours.filter(h=>h.userId===s.id&&h.status==='verified');
-      const total = Math.round(vh.reduce((a,h)=>a+h.hours,0)*100)/100;
-      const last30 = Math.round(vh.filter(h=>(Date.now()-new Date(h.startTime))<30*864e5).reduce((a,h)=>a+h.hours,0)*100)/100;
-      return {
-        name:(s.firstName||'')+' '+((s.lastName||'')[0]?s.lastName[0]+'.':''),
-        school:s.school||'', hours:total, last30, events:vh.length,
-        awards:AWARDS.filter(a=>total>=a.hours).length
-      };
-    }).filter(r=>r.hours>0).sort((a,b)=>b.hours-a.hours).slice(0,10);
-    const schools = {};
-    students.forEach(s=>{
-      if (!s.school) return;
-      const vh = DB.hours.filter(h=>h.userId===s.id&&h.status==='verified').reduce((a,h)=>a+h.hours,0);
-      if (!schools[s.school]) schools[s.school]={school:s.school,hours:0,students:0};
-      schools[s.school].hours = Math.round((schools[s.school].hours+vh)*100)/100;
-      if (vh>0) schools[s.school].students++;
-    });
-    return json(res,{
-      topVolunteers,
-      topSchools: Object.values(schools).filter(s=>s.hours>0).sort((a,b)=>b.hours-a.hours).slice(0,5),
-      community:{
-        totalHours: Math.round(DB.hours.filter(h=>h.status==='verified').reduce((a,h)=>a+h.hours,0)*100)/100,
-        students: students.length,
-        orgs: DB.users.filter(u=>u.role==='org'&&u.adminApproved).length,
-        events: DB.hours.filter(h=>h.status==='verified').length
-      }
-    });
+    let lb = cacheGet('leaderboard');
+    if (!lb) {
+      const idx = IDX();
+      // Per-student verified hours via the hoursByUser index (was an N+1 scan of DB.hours
+      // per student on every uncached call — and the result was never actually cached).
+      const verifiedHoursOf = s => idxList(idx.hoursByUser, s.id).filter(h=>h.status==='verified');
+      const students = DB.users.filter(u=>u.role==='student');
+      const topVolunteers = students.map(s=>{
+        const vh = verifiedHoursOf(s);
+        const total = Math.round(vh.reduce((a,h)=>a+h.hours,0)*100)/100;
+        const last30 = Math.round(vh.filter(h=>(Date.now()-new Date(h.startTime))<30*864e5).reduce((a,h)=>a+h.hours,0)*100)/100;
+        return {
+          name:(s.firstName||'')+' '+((s.lastName||'')[0]?s.lastName[0]+'.':''),
+          school:s.school||'', hours:total, last30, events:vh.length,
+          awards:AWARDS.filter(a=>total>=a.hours).length
+        };
+      }).filter(r=>r.hours>0).sort((a,b)=>b.hours-a.hours).slice(0,10);
+      const schools = {};
+      students.forEach(s=>{
+        if (!s.school) return;
+        const vh = verifiedHoursOf(s).reduce((a,h)=>a+h.hours,0);
+        if (!schools[s.school]) schools[s.school]={school:s.school,hours:0,students:0};
+        schools[s.school].hours = Math.round((schools[s.school].hours+vh)*100)/100;
+        if (vh>0) schools[s.school].students++;
+      });
+      lb = cacheSet('leaderboard', {
+        topVolunteers,
+        topSchools: Object.values(schools).filter(s=>s.hours>0).sort((a,b)=>b.hours-a.hours).slice(0,5),
+        community:{
+          totalHours: Math.round(DB.hours.filter(h=>h.status==='verified').reduce((a,h)=>a+h.hours,0)*100)/100,
+          students: students.length,
+          orgs: DB.users.filter(u=>u.role==='org'&&u.adminApproved).length,
+          events: DB.hours.filter(h=>h.status==='verified').length
+        }
+      }, 15000);
+    }
+    return jsonCacheable(req, res, lb, 'leaderboard', 30);
   }
 
   // ══════════════════════════════════════════
@@ -2730,6 +2791,19 @@ function retentionPurge() {
   };
   // Read notifications older than 90 days
   DB.notifications = DB.notifications.filter(n => !(n.read && (now - new Date(n.createdAt)) > 90*864e5));
+  // Bound notifications per user to the most recent MAX_NOTIF_PER_USER so a single very
+  // active account can't grow this collection (and every saveDB serialise) without limit.
+  // Uses object identity (not id) so it's independent of the notification shape.
+  const MAX_NOTIF_PER_USER = Number(process.env.MAX_NOTIF_PER_USER) || 200;
+  const _byUser = new Map();
+  for (const n of DB.notifications) { let g = _byUser.get(n.userId); if (!g) _byUser.set(n.userId, g = []); g.push(n); }
+  const _keepNotif = new Set();
+  for (const list of _byUser.values()) {
+    if (list.length <= MAX_NOTIF_PER_USER) { for (const n of list) _keepNotif.add(n); continue; }
+    list.sort((a,b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+    for (const n of list.slice(0, MAX_NOTIF_PER_USER)) _keepNotif.add(n);
+  }
+  if (_keepNotif.size !== DB.notifications.length) DB.notifications = DB.notifications.filter(n => _keepNotif.has(n));
   // Resolved reports older than 1 year
   DB.reports = DB.reports.filter(r => !(r.status !== 'open' && (now - new Date(r.createdAt)) > 365*864e5));
   // Expired event check-in codes
@@ -2855,7 +2929,7 @@ module.exports = {
   start, buildServer, router, loadDB, saveDB, seedDB, backupSnapshot, restoreFromBackup, retentionPurge,
   appendAudit, verifyAuditChain, makeToken, verifyToken, hashPassword, hashPasswordScrypt, verifyPassword, setPassword, weakPassword, publicOpp, sstr, clampNum, isEmail,
   calcHours, isValidOccurrence, nextOccurrenceAfter, orgPlan, rateLimit, makeBreaker,
-  IDX, idxList, bumpCache,
+  IDX, idxList, bumpCache, saveDBSoon,
   get DB(){ return DB; }, set DB(v){ DB = v; },
   PLANS, AWARDS,
 };
