@@ -84,3 +84,33 @@ All routes are in `server.js` as `if (method==='GET' && p==='/api/...')` blocks.
 - Security helpers: `esc()` (HTML, escapes `'` too), `jsq()` (user strings inside single-quoted onclick JS), `safeHref()` (http/https only). Server-side `publicOpp()` strips internal fields (checkinCodes, views, orgEmail, etc.) from every student/public opportunity response — keep using it on any new endpoint that returns opportunities.
 - **Icons are PNG, not emoji**: a `twemojify()` walker + `MutationObserver` at the end of `index.html` swaps emoji text for self-hosted Twemoji `<img class="emoji" src="/emoji/<codepoint>.png">` (static + dynamic DOM). The **full** Twemoji v15.1.0 72×72 set (~3.8k files) lives in `public/emoji/`, so any user-generated emoji (incl. flags, ZWJ sequences, keycaps, skin tones) renders. Graphemes are clustered with `Intl.Segmenter`; the filename follows Twemoji's rule (drop `FE0F` unless ZWJ). Detection is `\p{Extended_Pictographic}`/`\p{Regional_Indicator}`, so non-pictographic dingbats (✓ ✕ ★ → ♡) naturally stay text; `©®™` are explicitly kept as text via `KEEP_TEXT`. A missing file `onerror`-reverts to text (cached in `MISSING`) — no allowlist to maintain. `manifest.json` is reference-only (not read at runtime).
 - **Brand assets are PNG, derived from the master logo**: `public/servelocal-logo.png` (1024² RGBA, white heart on a green tile) is the source of truth and is used directly as the nav + footer mark (`.brand-logo`). `scripts/genbrand.js` (zero-dep, `zlib` only — it decodes the master PNG, box-filter downscales, and composites) regenerates `favicon-16/32.png`, `apple-touch-icon.png`, and the 1200×630 `og-image.png`. Replace `servelocal-logo.png` and re-run `node scripts/genbrand.js` to rebrand. The wordmark stays HTML text (a11y + crispness). Head wires `<link rel=icon>`, `apple-touch-icon`, theme-color, OG/Twitter meta (canonical URL `https://servelocal.org`).
+
+## Documentation cadence
+
+Update `docs/record_2026-07-02.md` and `docs/state_<YYYY-MM-DD>.md` **every 3 prompts** to
+reflect current project state. This is an engineering diary of *the build* (decisions, bugs,
+how understanding evolved), not application/logistics tracking.
+
+- **Record** (`docs/record_2026-07-02.md`): chronological, append-only build log. Every entry is
+  timestamped (date + approx time, e.g. "2026-07-03 14:20"). For each meaningful change, capture:
+    - **WHAT** changed (feature, fix, refactor)
+    - **WHY** — what problem it solved, what tradeoff was weighed
+    - **HOW** — the approach taken, especially if non-obvious or if an earlier approach was tried
+      and abandoned
+    - Any **bug** found + root cause + fix (these make the best essay material — they show real
+      debugging, not just feature-add)
+
+  Never edit or delete a past entry. If something logged turns out wrong, add a NEW entry
+  correcting it and reference the old one — the trail of "I thought X, then learned Y" is itself
+  valuable narrative material. Append as new dated sections, never rewrite history. If a file is
+  renamed, note it at every old reference so links don't silently break.
+- **State** (`docs/state_<YYYY-MM-DD>.md`): always-current snapshot of where the project stands
+  (architecture, what's done, what's in progress, known limitations). Create a NEW dated file when
+  the architecture or scope shifts significantly; mark the old one
+  "SUPERSEDED — see state_<new-date>.md" at the top instead of deleting it.
+- If the cadence slips (>3 prompts without an update), catch up at the next prompt and note in the
+  record how many prompts it slipped by (honest audit trail, not retroactively cleaned up).
+- Convert relative dates ("yesterday", "last week") to absolute dates immediately — the record gets
+  read months later when "yesterday" is meaningless.
+
+**Current files:** record = `docs/record_2026-07-02.md` · latest state = `docs/state_2026-07-03.md`.
