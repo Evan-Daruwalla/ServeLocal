@@ -882,6 +882,7 @@ textarea.fc{resize:vertical;min-height:90px}
       <div id="recs-scroll" style="display:flex;gap:14px;overflow-x:auto;padding-bottom:8px"></div>
     </div>
     <div id="opps-grid" class="cards-grid"><div class="loading"><div class="spinner"></div><div>Loading…</div></div></div>
+    <div id="opps-load-more-wrap" style="text-align:center;margin-top:20px"></div>
   </div>
 </div>
 
@@ -1486,6 +1487,22 @@ textarea.fc{resize:vertical;min-height:90px}
         <div class="fr"><label>Password</label><input class="fc" id="login-pw" type="password" placeholder="••••••••" onkeydown="if(event.key==='Enter')doLogin()"></div>
         <button class="fsubmit" style="width:100%" onclick="doLogin()">Log In</button>
         <p style="font-size:.8rem;color:var(--muted);text-align:center;margin-top:14px">Don't have an account? <span style="color:var(--green);cursor:pointer;font-weight:600" onclick="switchAuth('register')">Sign up free</span></p>
+        <p style="font-size:.8rem;text-align:center;margin-top:6px"><span style="color:var(--muted);cursor:pointer;text-decoration:underline" onclick="switchAuth('forgot')">Forgot password?</span></p>
+      </div>
+      <!-- Forgot password -->
+      <div id="auth-forgot-form" style="display:none">
+        <div id="forgot-err" class="ferr"></div>
+        <p style="font-size:.85rem;color:var(--muted);margin-bottom:14px">Enter your account email and we'll send you a reset link (valid for 1 hour).</p>
+        <div class="fr"><label>Email</label><input class="fc" id="forgot-email" type="email" placeholder="you@example.com" onkeydown="if(event.key==='Enter')doForgot()"></div>
+        <button class="fsubmit" style="width:100%" onclick="doForgot()">Send Reset Link</button>
+        <p style="font-size:.8rem;color:var(--muted);text-align:center;margin-top:14px"><span style="color:var(--green);cursor:pointer;font-weight:600" onclick="switchAuth('login')">← Back to log in</span></p>
+      </div>
+      <!-- Reset password (arrived via #reset/<token> email link) -->
+      <div id="auth-reset-form" style="display:none">
+        <div id="reset-err" class="ferr"></div>
+        <div class="fr"><label>New password</label><input class="fc" id="reset-pw" type="password" placeholder="At least 8 characters"></div>
+        <div class="fr"><label>Confirm new password</label><input class="fc" id="reset-pw2" type="password" placeholder="Repeat it" onkeydown="if(event.key==='Enter')doReset()"></div>
+        <button class="fsubmit" style="width:100%" onclick="doReset()">Set New Password</button>
       </div>
       <!-- Student register -->
       <div id="auth-student-form" style="display:none">
@@ -1846,6 +1863,7 @@ const API = '';
 let currentUser = null;
 let token = localStorage.getItem('sl_token') || null;
 let allOpps = [];
+let oppsRawCount = 0, oppsTotal = 0; // pagination bookkeeping (ADR-0013 — server caps /api/opportunities to a page)
 let myHours = [];
 let myApps = [];
 let hoursFilter = 'all';
@@ -1904,7 +1922,7 @@ async function api(endpoint, opts={}) {
     }
     let data={}; try{ data=await res.json(); }catch{}
     if (!res.ok) { const e=new Error(data.error||'Request failed'); e.code=data.code; throw e; }
-    return data;
+    return opts.raw ? {data, headers:res.headers} : data;
   }
   throw lastErr||new Error('Request failed');
 }
@@ -2386,26 +2404,83 @@ function setNavActive(id) {
 }
 
 // ── OPPORTUNITIES ─────────────────────────────
+const OPPS_PAGE_SIZE = 60; // matches the server default (ADR-0013); explicit so offset math is exact
+function oppsFilterParams() {
+  const q = val('opp-q'); const cat = val('f-cat');
+  const commit = val('f-commit'); const date = val('f-date');
+  const miles = val('f-miles') || '15';
+  let params = new URLSearchParams();
+  if (q) params.set('q',q);
+  if (cat) params.set('category',cat);
+  if (commit) params.set('commitment',commit);
+  if (date) params.set('startDate',date);
+  if (zipCoords) { params.set('zipLat',zipCoords.lat); params.set('zipLng',zipCoords.lng); params.set('maxMiles',miles); }
+  return params;
+}
 async function loadOpps() {
   const grid = document.getElementById('opps-grid');
   grid.innerHTML = '<div class="loading"><div class="spinner"></div><div>Loading…</div></div>';
   try {
-    const q = val('opp-q'); const cat = val('f-cat');
-    const commit = val('f-commit'); const format = val('f-format'); const date = val('f-date');
-    const miles = val('f-miles') || '15';
-    let params = new URLSearchParams();
-    if (q) params.set('q',q);
-    if (cat) params.set('category',cat);
-    if (commit) params.set('commitment',commit);
-    if (date) params.set('startDate',date);
-    if (zipCoords) { params.set('zipLat',zipCoords.lat); params.set('zipLng',zipCoords.lng); params.set('maxMiles',miles); }
-    allOpps = await api('/api/opportunities?'+params);
-    if (format) allOpps = allOpps.filter(o=>(o.format||'In-Person')===format);
+    const format = val('f-format');
+    const params = oppsFilterParams();
+    params.set('limit', OPPS_PAGE_SIZE);
+    const {data, headers} = await api('/api/opportunities?'+params, {raw:true});
+    oppsRawCount = data.length;
+    oppsTotal = Number(headers.get('x-total-count')) || data.length;
+    allOpps = format ? data.filter(o=>(o.format||'In-Person')===format) : data;
     renderOpps(allOpps);
+    renderLoadMoreBtn();
+    updateDiscoverHash();
     renderFilterChips();
     loadRecommendations();
     loadSavedSearches();
   } catch(e) { grid.innerHTML=`<div class="loading" style="color:var(--red)">${esc(e.message)}</div>`; }
+}
+async function loadMoreOpps() {
+  const btn = document.getElementById('opps-load-more-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
+  try {
+    const format = val('f-format');
+    const params = oppsFilterParams();
+    params.set('limit', OPPS_PAGE_SIZE);
+    params.set('offset', oppsRawCount);
+    const {data, headers} = await api('/api/opportunities?'+params, {raw:true});
+    oppsRawCount += data.length;
+    oppsTotal = Number(headers.get('x-total-count')) || oppsTotal;
+    allOpps = allOpps.concat(format ? data.filter(o=>(o.format||'In-Person')===format) : data);
+    renderOpps(allOpps);
+  } catch(e) { toast(e.message,'err'); }
+  renderLoadMoreBtn();
+}
+function renderLoadMoreBtn() {
+  const wrap = document.getElementById('opps-load-more-wrap');
+  if (!wrap) return;
+  const remaining = oppsTotal - oppsRawCount;
+  const count = oppsTotal>0 ? `<div style="font-size:.78rem;color:var(--muted);margin-bottom:${remaining>0?'10px':'0'}">Showing ${allOpps.length} of ${oppsTotal}</div>` : '';
+  wrap.innerHTML = count + (remaining>0 ? `<button class="btn-s" id="opps-load-more-btn" onclick="loadMoreOpps()">Load more (${remaining} more)</button>` : '');
+}
+// Mirror the active Discover filters into the hash (#discover?q=…&cat=…) so a
+// filtered view survives refresh and can be shared. replaceState (not pushState)
+// — typing in the search box must not spam history entries.
+function updateDiscoverHash() {
+  if (!document.getElementById('view-discover')?.classList.contains('active')) return;
+  const qs = new URLSearchParams();
+  const put = (k, v) => { if (v) qs.set(k, v); };
+  put('q', val('opp-q')); put('cat', val('f-cat')); put('commit', val('f-commit'));
+  put('format', val('f-format')); put('date', val('f-date'));
+  put('zip', val('f-zip')); if (zipCoords) put('miles', val('f-miles'));
+  const s = qs.toString();
+  try { history.replaceState(null, '', '#discover' + (s ? '?' + s : '')); } catch { /* very old browsers */ }
+}
+// Restore filters from #discover?… (inverse of updateDiscoverHash), then load.
+function restoreDiscoverFilters(hashQs) {
+  const qp = new URLSearchParams(hashQs || '');
+  const set = (id, v) => { const el = document.getElementById(id); if (el && v) el.value = v; };
+  set('opp-q', qp.get('q')); set('f-cat', qp.get('cat')); set('f-commit', qp.get('commit'));
+  set('f-format', qp.get('format')); set('f-date', qp.get('date'));
+  set('f-miles', qp.get('miles')); set('f-zip', qp.get('zip'));
+  if (qp.get('zip') && /^\d{5}$/.test(qp.get('zip'))) applyZip(); // geocodes, then calls loadOpps
+  else loadOpps();
 }
 function debounce(){ clearTimeout(searchTimer); searchTimer=setTimeout(loadOpps,320); }
 
@@ -3718,17 +3793,43 @@ async function submitReport() {
 
 // ── AUTH ──────────────────────────────────────
 function openAuth(mode) {
-  hide('auth-role-step'); hide('auth-login-form'); hide('auth-student-form'); hide('auth-org-form');
+  hide('auth-role-step'); hide('auth-login-form'); hide('auth-student-form'); hide('auth-org-form'); hide('auth-forgot-form'); hide('auth-reset-form');
   if (mode==='login') { show('auth-login-form'); setText('auth-modal-title','Welcome Back'); }
   else if (mode==='register') { show('auth-role-step'); setText('auth-modal-title','Create Your Account'); }
   else if (mode==='register-org') { show('auth-org-form'); setText('auth-modal-title','Register Your Organization'); }
+  else if (mode==='forgot') { show('auth-forgot-form'); setText('auth-modal-title','Reset Your Password'); }
+  else if (mode==='reset') { show('auth-reset-form'); setText('auth-modal-title','Choose a New Password'); }
   openM('auth-overlay');
 }
 
 function switchAuth(mode) {
-  hide('auth-role-step'); hide('auth-login-form'); hide('auth-student-form'); hide('auth-org-form');
+  hide('auth-role-step'); hide('auth-login-form'); hide('auth-student-form'); hide('auth-org-form'); hide('auth-forgot-form'); hide('auth-reset-form');
   if (mode==='login') { show('auth-login-form'); setText('auth-modal-title','Welcome Back'); }
+  else if (mode==='forgot') { show('auth-forgot-form'); setText('auth-modal-title','Reset Your Password'); }
   else { show('auth-role-step'); setText('auth-modal-title','Create Your Account'); }
+}
+
+async function doForgot() {
+  const email = val('forgot-email');
+  const err = document.getElementById('forgot-err'); err.style.display='none';
+  if (!email) { err.textContent='Enter your email.'; err.style.display='block'; return; }
+  try {
+    const r = await api('/api/auth/forgot',{method:'POST',body:JSON.stringify({email})});
+    closeM('auth-overlay'); toast(r.message||'Reset link sent — check your email 📬');
+  } catch(e){ err.textContent=e.message; err.style.display='block'; }
+}
+
+let _resetToken = null; // set by the #reset/<token> route
+async function doReset() {
+  const pw = val('reset-pw'), pw2 = val('reset-pw2');
+  const err = document.getElementById('reset-err'); err.style.display='none';
+  if (!pw||pw.length<8) { err.textContent='Password must be at least 8 characters.'; err.style.display='block'; return; }
+  if (pw!==pw2) { err.textContent='Passwords do not match.'; err.style.display='block'; return; }
+  try {
+    await api('/api/auth/reset',{method:'POST',body:JSON.stringify({token:_resetToken,password:pw})});
+    _resetToken=null; toast('Password updated — log in with your new password 🔑');
+    switchAuth('login');
+  } catch(e){ err.textContent=e.message; err.style.display='block'; }
 }
 
 function selectRole(role) {
@@ -4113,8 +4214,9 @@ async function routeFromHash(){
   _routing = true;
   try {
     if (!h) { nav('home'); return; }
-    const [page, param] = h.split('/');
-    if (page==='discover') { nav('discover'); loadOpps(); }
+    const [pathPart, hashQs] = h.split('?');
+    const [page, param] = pathPart.split('/');
+    if (page==='discover') { nav('discover'); restoreDiscoverFilters(hashQs); }
     else if (page==='community') { await loadCommunity(); }
     else if (page==='donate') { await loadDonate(); }
     else if (page==='pricing') { await loadPricing(); }
@@ -4123,6 +4225,7 @@ async function routeFromHash(){
     else if (page==='terms') { nav('terms'); }
     else if (page==='consent'&&param) { await loadConsentView(param); }
     else if (page==='consent-manage'&&param) { await loadConsentManageView(param); }
+    else if (page==='reset'&&param) { _resetToken=param; nav('home'); openAuth('reset'); history.replaceState(null,'',location.pathname); /* drop the token from the URL/history */ }
     else if (page==='dash'||page==='org-dash') {
       if (currentUser?.role==='org') await loadOrgDash();
       else if (currentUser?.role==='student') await loadStudentDash();
@@ -4135,7 +4238,7 @@ async function routeFromHash(){
     else if (page==='reviews'&&param) { await openReviewsPage(param); }
     else if (page==='opp'&&param) {
       nav('discover');
-      try { if (!allOpps.length) { allOpps = await api('/api/opportunities'); renderOpps(allOpps); renderFilterChips(); } } catch {}
+      try { if (!allOpps.length) { allOpps = await api('/api/opportunities?limit=200'); renderOpps(allOpps); renderFilterChips(); } } catch {}
       try { await openOpp(param); } catch { toast('That listing is no longer available','err'); }
     }
     else nav('home');
@@ -4195,7 +4298,7 @@ async function loadSavedOppsPanel(){
   if (!ids.length) { el.innerHTML='<div class="empty"><div class="empty-icon">🔖</div>Nothing saved yet. Tap the ♡ on any listing in Discover to bookmark it.</div>'; return; }
   el.innerHTML = '<div class="loading"><div class="spinner"></div></div>';
   try {
-    const all = await api('/api/opportunities');
+    const all = await api('/api/opportunities?limit=200');
     if (!allOpps.length) allOpps = all;
     const saved = all.filter(o=>ids.includes(o.id));
     if (!saved.length) { el.innerHTML='<div class="empty"><div class="empty-icon">🔖</div>Your saved listings are no longer active.</div>'; return; }

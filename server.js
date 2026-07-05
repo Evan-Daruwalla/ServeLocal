@@ -9,6 +9,7 @@ const fs   = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const url  = require('url');
+const zlib = require('zlib');
 const Database = require('better-sqlite3');
 
 // ── LOAD .env FILE ────────────────────────────────
@@ -190,6 +191,11 @@ function buildIndexes() {
     reviewsByOrg: group(DB.reviews, 'orgId'),
     oppsByOrg: group(DB.opportunities, 'orgId'),
     endorsementsByUser: group(DB.endorsements, 'userId'),
+    // code string -> {opp, dateStr} for O(1) check-in redemption. Codes are added by
+    // FIELD mutation (no structural rebuild fires), so the generation site also .set()s
+    // into this map directly; entries here are hints, and the redemption path re-validates
+    // against opp.checkinCodes (the source of truth), so a stale hint can never verify.
+    checkinCodeByStr: (() => { const m = new Map(); for (const o of DB.opportunities) for (const [d, e] of Object.entries(o.checkinCodes || {})) m.set(e.code, { opp: o, dateStr: d }); return m; })(),
   };
   _idxSig = idxSignature();
   _idxDbRef = DB;
@@ -330,6 +336,66 @@ function _readAllFromSqlite(db) {
   });
   return out;
 }
+
+// ── Incremental persistence ─────────────────────────────────────────
+// A long-lived WAL-mode handle + a per-row content hash let saveDB() write only
+// rows that actually changed since the last flush, instead of rewriting every
+// row of every table (which at 100k users meant ~760MB of disk I/O per save).
+// WAL replaces the old temp-file+rename dance for crash safety: a torn write
+// can only ever affect the -wal sidecar, never the main file. The hash map is
+// ~20 bytes/row (not a second copy of the DB) and is only replaced after a
+// flush commits, so a failed transaction can't desync it from disk.
+let _sqldb = null;          // persistent handle; null until first successful load/save
+let _rowHashes = null;      // {collection: Map(pk -> sha1)} mirror of what's on disk; null = disk state unknown, rewrite all
+const _rowHash = s => crypto.createHash('sha1').update(s).digest('base64');
+function _openLive(file) {
+  const db = _openSqlite(file);
+  db.pragma('journal_mode = WAL');
+  db.pragma('synchronous = NORMAL'); // fsync on checkpoint, not every commit — WAL keeps commits durable-enough (power-loss window = last checkpoint)
+  return db;
+}
+function _hashAll(db) {
+  const out = {};
+  DB_COLLECTIONS.forEach(k => {
+    out[k] = new Map(db.prepare(`SELECT ${_pk(k)} pk, data FROM "${k}"`).all().map(r => [r.pk, _rowHash(r.data)]));
+  });
+  return out;
+}
+// Flush the in-memory DB to the live handle, writing only changed/new rows and
+// deleting removed ones. With _rowHashes === null (fresh handle, or memory was
+// swapped by a restore) every table is cleared and rewritten.
+function _flushIncremental(db) {
+  const next = {};
+  const work = []; // [{k, upserts:[[pk,json]], deletes:[pk]}]
+  DB_COLLECTIONS.forEach(k => {
+    const prev = _rowHashes && _rowHashes[k];
+    const map = new Map(); const upserts = [];
+    for (const row of DB[k]) {
+      const s = JSON.stringify(row); const pk = row[_pk(k)]; const h = _rowHash(s);
+      map.set(pk, h);
+      if (!prev || prev.get(pk) !== h) upserts.push([pk, s]);
+    }
+    const deletes = [];
+    if (prev) { for (const pk of prev.keys()) if (!map.has(pk)) deletes.push(pk); }
+    next[k] = map;
+    if (upserts.length || deletes.length || !prev) work.push({ k, upserts, deletes, wipe: !prev });
+  });
+  if (work.length) {
+    db.transaction(() => {
+      for (const { k, upserts, deletes, wipe } of work) {
+        const pk = _pk(k);
+        if (wipe) db.prepare(`DELETE FROM "${k}"`).run();
+        const up = db.prepare(`INSERT OR REPLACE INTO "${k}" (${pk}, data) VALUES (?, ?)`);
+        for (const [id, s] of upserts) up.run(id, s);
+        if (deletes.length) { const del = db.prepare(`DELETE FROM "${k}" WHERE ${pk} = ?`); for (const id of deletes) del.run(id); }
+      }
+    })();
+  }
+  _rowHashes = next; // only after commit — a throw above leaves the old mirror intact
+}
+function closeDB() {
+  if (_sqldb) { try { _sqldb.close(); } catch { /* already closed */ } _sqldb = null; _rowHashes = null; }
+}
 function _writeAllToSqlite(db, data) {
   db.transaction(() => {
     DB_COLLECTIONS.forEach(k => {
@@ -342,17 +408,19 @@ function _writeAllToSqlite(db, data) {
 }
 
 function loadDB() {
+  closeDB(); // tests re-load onto a fresh temp file; never hold the previous one open
   try {
     if (fs.existsSync(DB_FILE)) {
-      const db = _openSqlite(DB_FILE);
-      DB = _readAllFromSqlite(db);
-      db.close();
+      _sqldb = _openLive(DB_FILE);
+      DB = _readAllFromSqlite(_sqldb);
+      _rowHashes = _hashAll(_sqldb); // mirror of on-disk state -> first flush only writes real changes
       console.log('📂 Database loaded');
     } else {
       seedDB();
     }
   } catch(e) {
     // Graceful degradation: a corrupt db.sqlite must not take the service down.
+    closeDB();
     console.error('DB load error:', e.message, '— attempting newest backup, else reseeding');
     // Persist the recovered state back to the primary file so disk is healthy
     // again immediately (not left corrupt until the next write). seedDB() already saves.
@@ -361,21 +429,31 @@ function loadDB() {
   }
 }
 
-// Atomic write: build a fresh sqlite file at a temp path, close it, then rename
-// over the primary file (rename is atomic on the same volume on both POSIX and
-// Windows), so a crash mid-write can never leave a half-written db.sqlite. A
-// failed save degrades gracefully — we keep serving from memory and flag
-// readiness rather than crashing.
+// Persist the in-memory DB. Normal path: incremental flush over the live WAL
+// handle (only changed rows touch disk). Fallback path (no healthy handle —
+// first boot, or the primary file was corrupt): build a fresh sqlite file at a
+// temp path and atomically rename it over the primary, then adopt it as the
+// live handle. A failed save degrades gracefully — we keep serving from memory
+// and flag readiness rather than crashing.
 function saveDB() {
   // An explicit save persists everything, so cancel any pending coalesced flush.
   _saveDirty = false; if (_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null; }
   try {
-    const tmp = DB_FILE + '.' + process.pid + '.tmp';
-    if (fs.existsSync(tmp)) fs.rmSync(tmp);
-    const db = _openSqlite(tmp);
-    _writeAllToSqlite(db, DB);
-    db.close();
-    fs.renameSync(tmp, DB_FILE);
+    if (!_sqldb) {
+      const tmp = DB_FILE + '.' + process.pid + '.tmp';
+      if (fs.existsSync(tmp)) fs.rmSync(tmp);
+      const db = _openSqlite(tmp);
+      _writeAllToSqlite(db, DB);
+      db.close();
+      // A leftover -wal/-shm from the file being replaced must not be paired
+      // with the fresh file (SQLite would try to replay the stale WAL into it).
+      for (const ext of ['-wal', '-shm']) { try { fs.rmSync(DB_FILE + ext, { force: true }); } catch { /* best effort */ } }
+      fs.renameSync(tmp, DB_FILE);
+      _sqldb = _openLive(DB_FILE);
+      _rowHashes = _hashAll(_sqldb);
+    } else {
+      _flushIncremental(_sqldb);
+    }
     _dbHealthy = true; _lastSaveFailure = null;
     bumpCache(); // any write invalidates read caches
   } catch (e) {
@@ -404,6 +482,9 @@ function backupSnapshot() {
   try {
     if (!fs.existsSync(DB_FILE)) return null;
     if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    // WAL keeps recent commits in the -wal sidecar; checkpoint first so the
+    // main file alone is a complete snapshot (a bare copyFileSync would miss them).
+    if (_sqldb) { try { _sqldb.pragma('wal_checkpoint(TRUNCATE)'); } catch { /* copy still valid, just older */ } }
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const dest = path.join(BACKUP_DIR, `db-${stamp}.sqlite`);
     fs.copyFileSync(DB_FILE, dest);
@@ -708,7 +789,7 @@ function getUser(req) {
 }
 function safeUser(u) {
   if (!u) return null;
-  const {passwordHash,salt,...rest} = u;
+  const {passwordHash,salt,resetTokenHash,resetTokenExpires,...rest} = u;
   return rest;
 }
 
@@ -813,12 +894,19 @@ function readBody(req) {
   });
 }
 function json(res,data,status=200,extraHeaders={}) {
-  const body = JSON.stringify(data);
+  let body = JSON.stringify(data);
   const acao = res._acao || '*';
+  // Gzip JSON bodies past ~1KB when the client accepts it — API responses are
+  // highly repetitive JSON (the opportunity list compresses ~8x), and zlib is
+  // built-in. Below 1KB the header overhead outweighs the savings.
+  const gzip = res._gzip && Buffer.byteLength(body) > 1024;
+  if (gzip) body = zlib.gzipSync(body);
+  const vary = [acao !== '*' ? 'Origin' : '', 'Accept-Encoding'].filter(Boolean).join(', ');
   res.writeHead(status,{
     'Content-Type':'application/json',
     'Access-Control-Allow-Origin':acao,
-    ...(acao !== '*' ? { 'Vary':'Origin' } : {}),
+    'Vary':vary,
+    ...(gzip ? { 'Content-Encoding':'gzip' } : {}),
     'Access-Control-Allow-Headers':'Content-Type,Authorization,Idempotency-Key',
     'Access-Control-Allow-Methods':'GET,POST,PUT,DELETE,PATCH,OPTIONS',
     'Cache-Control':'no-store',
@@ -837,7 +925,7 @@ function jsonCacheable(req, res, data, key, maxAge = 30, extraHeaders = {}) {
   const etag = 'W/"' + crypto.createHash('sha1').update(_cacheVersion + '|' + key).digest('hex').slice(0, 16) + '"';
   const cc = 'public, max-age=' + maxAge;
   if (req.headers['if-none-match'] === etag) {
-    res.writeHead(304, { ETag: etag, 'Cache-Control': cc, ...extraHeaders, ...securityHeaders() });
+    res.writeHead(304, { ETag: etag, 'Cache-Control': cc, 'Vary': 'Accept-Encoding', ...extraHeaders, ...securityHeaders() });
     return res.end();
   }
   return json(res, data, 200, { 'Cache-Control': cc, ETag: etag, ...extraHeaders });
@@ -946,6 +1034,7 @@ async function router(req, res) {
   const method = req.method;
   const ip = clientIp(req);
   res._acao = resolveCors(req); // per-request CORS origin, read by json()
+  res._gzip = /\bgzip\b/.test(req.headers['accept-encoding'] || ''); // read by json()
 
   if (method==='OPTIONS') {
     res.writeHead(204,{'Access-Control-Allow-Origin':res._acao,...(res._acao!=='*'?{'Vary':'Origin'}:{}),'Access-Control-Allow-Headers':'Content-Type,Authorization,Idempotency-Key','Access-Control-Allow-Methods':'GET,POST,PUT,DELETE,PATCH,OPTIONS'});
@@ -1104,6 +1193,50 @@ async function router(req, res) {
     const upgraded = migrateLegacyPassword(found, password);
     appendAudit(found.id,'auth.login.success','',{ip,role:found.role,upgraded}); saveDB();
     return json(res,{token:makeToken(found),user:safeUser(found)});
+  }
+
+  // POST /api/auth/forgot — request a password-reset email.
+  // Always answers 200 with the same body (no account enumeration); the token is
+  // stored only as a sha256 hash (a DB leak can't be replayed), single-use, 1h TTL.
+  if (method==='POST' && p==='/api/auth/forgot') {
+    const email = String(body.email||'').toLowerCase();
+    if (!isEmail(email)) return json(res,{error:'Enter a valid email address'},400);
+    const throttleKey = 'reset|'+loginThrottleKey(req, email);
+    const attempts = loginAttempts.get(throttleKey);
+    if (attempts && Date.now()-attempts.first >= 15*60*1000) loginAttempts.delete(throttleKey);
+    else if (attempts && attempts.count >= 3)
+      return json(res,{error:'Too many reset requests. Please try again in 15 minutes.'},429);
+    const rec = loginAttempts.get(throttleKey)||{count:0,first:Date.now()};
+    rec.count++; loginAttempts.set(throttleKey,rec);
+    const u = IDX().userByEmail.get(email);
+    if (u) {
+      const token = crypto.randomBytes(32).toString('hex');
+      u.resetTokenHash = hashToken(token);
+      u.resetTokenExpires = new Date(Date.now()+60*60*1000).toISOString();
+      sendEmail(u.email, 'Reset your ServeLocal password',
+        `Someone (hopefully you) requested a password reset for this ServeLocal account.\n\n` +
+        `Reset it here (expires in 1 hour):\n${PUBLIC_BASE_URL}/#reset/${token}\n\n` +
+        `If you didn't ask for this, you can ignore this email — your password is unchanged.\n\n— ServeLocal`);
+      appendAudit(u.id,'auth.password_reset_requested','',{ip}); saveDB();
+    }
+    return json(res,{ok:true,message:'If an account exists for that email, a reset link has been sent.'});
+  }
+
+  // POST /api/auth/reset — redeem a reset token for a new password.
+  if (method==='POST' && p==='/api/auth/reset') {
+    const token = String(body.token||''); const password = String(body.password||'');
+    if (!token || !password) return json(res,{error:'Token and new password are required'},400);
+    if (password.length<8) return json(res,{error:'Password must be at least 8 characters'},400);
+    const th = hashToken(token);
+    const u = DB.users.find(x=>x.resetTokenHash && x.resetTokenHash===th);
+    if (!u || !u.resetTokenExpires || new Date(u.resetTokenExpires) < new Date())
+      return json(res,{error:'This reset link is invalid or has expired. Request a new one.'},400);
+    if (weakPassword(password, u.email)) return json(res,{error:'That password is too common or easy to guess. Please choose a stronger one.'},400);
+    setPassword(u, password);
+    u.resetTokenHash = ''; u.resetTokenExpires = null; // single-use
+    u.tokenVersion = (u.tokenVersion||0)+1; // revoke every existing session
+    appendAudit(u.id,'auth.password_reset','',{ip}); saveDB();
+    return json(res,{ok:true,message:'Password updated. You can now log in.'});
   }
 
   // POST /api/auth/signout-all — revoke every existing session for this user
@@ -1270,6 +1403,12 @@ async function router(req, res) {
 
   // GET /api/opportunities
   if (method==='GET' && p==='/api/opportunities') {
+    // Whole-page compute cache: within max-age the filter/sort/badge pipeline below is
+    // identical for every caller (public, user-agnostic), so serve the last computed page.
+    // Version-keyed like the leaderboard cache — any write invalidates immediately.
+    const _oppsCK = 'opps-page|' + (parsed.search || '');
+    const _oppsHit = cacheGet(_oppsCK);
+    if (_oppsHit) return jsonCacheable(req, res, _oppsHit.page, _oppsCK, 15, { 'X-Total-Count': String(_oppsHit.total) });
     const {q,category,skill,startDate,endDate,commitment,orgId,zipLat,zipLng,maxMiles} = parsed.query;
     const radiusMiles = Math.min(parseFloat(maxMiles)||15, 50); // default 15 mi, cap 50
     let opps = DB.opportunities.filter(o=>{
@@ -1324,8 +1463,9 @@ async function router(req, res) {
       if (org?.createdAt&&(Date.now()-new Date(org.createdAt))>180*864e5&&org.adminApproved) badges.push('established');
       return {...publicOpp(o), applicantCount:ac, badges};
     });
+    cacheSet(_oppsCK, { page: opps, total }, 15000);
     // Public, user-agnostic list -> allow short-lived browser/CDN caching + 304 revalidation.
-    return jsonCacheable(req, res, opps, 'opps|' + (parsed.search || '') + '|' + limit + '|' + offset, 15, { 'X-Total-Count': String(total) });
+    return jsonCacheable(req, res, opps, _oppsCK, 15, { 'X-Total-Count': String(total) });
   }
 
   // GET /api/opportunities/:id/date-spots  →  per-occurrence spot counts for recurring events
@@ -2599,6 +2739,7 @@ async function router(req, res) {
       let code=''; for (let i=0;i<6;i++) code+=chars[crypto.randomInt(chars.length)];
       entry = { code, expiresAt: Date.now()+12*36e5 };
       opp.checkinCodes[dateStr]=entry;
+      IDX().checkinCodeByStr.set(code, { opp, dateStr }); // field mutation -> no structural rebuild; keep the lookup map current
       appendAudit(user.id,'checkin.code_generated',opp.id,{date:dateStr});
       saveDB();
     }
@@ -2612,14 +2753,25 @@ async function router(req, res) {
     if (consentBlock) return json(res,consentBlock,403);
     const code = String(body.code||'').trim().toUpperCase();
     if (!code) return json(res,{error:'Code required'},400);
+    // Verified hours are the currency of the platform — throttle guessing per user
+    // (10 failed attempts / 15 min), same shape as the login throttle.
+    const ckKey = 'checkin|'+user.id;
+    const ckAttempts = loginAttempts.get(ckKey);
+    if (ckAttempts && Date.now()-ckAttempts.first >= 15*60*1000) loginAttempts.delete(ckKey);
+    else if (ckAttempts && ckAttempts.count >= 10)
+      return json(res,{error:'Too many incorrect codes. Please try again in 15 minutes.'},429);
+    // O(1) lookup via the code index, re-validated against the opportunity itself
+    // (the index entry is a hint — see buildIndexes).
+    const hit = IDX().checkinCodeByStr.get(code);
+    const live = hit && hit.opp.checkinCodes && hit.opp.checkinCodes[hit.dateStr];
     let opp=null, dateStr=null;
-    for (const o of DB.opportunities) {
-      for (const [d,e] of Object.entries(o.checkinCodes||{})) {
-        if (e.code===code && e.expiresAt>=Date.now()) { opp=o; dateStr=d; break; }
-      }
-      if (opp) break;
+    if (live && live.code===code && live.expiresAt>=Date.now()) { opp=hit.opp; dateStr=hit.dateStr; }
+    if (!opp) {
+      const rec = loginAttempts.get(ckKey)||{count:0,first:Date.now()};
+      rec.count++; loginAttempts.set(ckKey,rec);
+      return json(res,{error:'Invalid or expired check-in code'},404);
     }
-    if (!opp) return json(res,{error:'Invalid or expired check-in code'},404);
+    loginAttempts.delete(ckKey);
     const app = DB.applications.find(a=>a.oppId===opp.id&&a.userId===user.id&&a.status==='approved');
     if (!app) return json(res,{error:'You need an approved signup for "'+opp.title+'" before checking in.'},400);
     const durHrs = opp.durationHours || (opp.endTime?(new Date(opp.endTime)-new Date(opp.startTime))/36e5:0);
@@ -2975,7 +3127,7 @@ function start() {
     }
   });
   // Graceful shutdown: flush DB and close listeners.
-  const shutdown = (sig)=>{ console.log(`\n${sig} — flushing DB and shutting down`); try{ saveDB(); }catch{} server.close(()=>process.exit(0)); setTimeout(()=>process.exit(0),3000).unref?.(); };
+  const shutdown = (sig)=>{ console.log(`\n${sig} — flushing DB and shutting down`); try{ saveDB(); }catch{} try{ closeDB(); }catch{} server.close(()=>process.exit(0)); setTimeout(()=>process.exit(0),3000).unref?.(); };
   process.on('SIGTERM',()=>shutdown('SIGTERM'));
   process.on('SIGINT',()=>shutdown('SIGINT'));
   return server;
@@ -2987,7 +3139,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  start, buildServer, router, loadDB, saveDB, seedDB, backupSnapshot, restoreFromBackup, retentionPurge,
+  start, buildServer, router, loadDB, saveDB, closeDB, seedDB, backupSnapshot, restoreFromBackup, retentionPurge,
   appendAudit, verifyAuditChain, makeToken, verifyToken, hashPassword, hashPasswordScrypt, verifyPassword, setPassword, weakPassword, publicOpp, sstr, clampNum, isEmail,
   calcHours, isValidOccurrence, nextOccurrenceAfter, orgPlan, rateLimit, makeBreaker,
   IDX, idxList, bumpCache, saveDBSoon,
