@@ -10,7 +10,7 @@ runtime dependencies (ADR-0001): pure Node.js `http`, no framework.
 
 ## Current state — Track 1 + scaling work shipped, Track 2 not started
 
-**Last updated: 2026-07-04 (evening)**
+**Last updated: 2026-07-05**
 
 Track 1 (guardian consent — the launch precondition for a platform with minor users) is done. The
 scaling work that followed (ADR-0011/0012) found the platform's real ceiling via load testing: the
@@ -32,6 +32,7 @@ is gone. Track 2 (notifications → messaging → Stripe → growth) has not sta
 | `npm run bench` / `npm run loadtest:scale` tooling | **Done** | `43ef219`, `a2164d4`; repeatable before/after + real HTTP numbers |
 | **SQLite migration + `/api/opportunities` pagination (ADR-0013)** | **Done** | Removes the confirmed ~90k-user JSON-string ceiling; verified at 100k users. `npm run migrate:sqlite` for existing `db.json` deployments. Committed `da9a27f`, pushed to `origin/master` |
 | **Security/perf batch (2026-07-04)** | **Done** | WAL-incremental writes, gzip JSON, opportunities page cache, password reset flow, check-in throttle + O(1) index, Discover URL state + Load More. 66 tests. 100k users: 130 → 4,167 req/s. Committed `05abeb9`, pushed to `origin/master` |
+| **CI fix: install deps in coverage & chaos jobs (2026-07-05)** | **Done** | The SQLite migration made `better-sqlite3` a real runtime dep; the `coverage` and `resilience` jobs skipped `npm install` and crashed on `Cannot find module 'better-sqlite3'` (only those two failed — `test` jobs already installed). Added the install step to both; also bumped `actions/checkout`/`setup-node` to `@v5` to clear the Node 20 deprecation warning. All 5 jobs green. Committed `a7dda9f` + `5d3a852`, pushed to `origin/master` |
 | Real notifications (Track 2 #1) | **Not started** | See `docs/roadmap.md` |
 | Shift templates + bulk messaging (Track 2 #2) | **Not started** | See `docs/roadmap.md` |
 | Live Stripe billing (Track 2 #3) | **Not started** | Currently DEMO mode (ADR-0004) |
@@ -64,5 +65,6 @@ is gone. Track 2 (notifications → messaging → Stripe → growth) has not sta
   by an earlier session's search) — all planning lives in `docs/roadmap.md` and the record.
 - No hard deadline or target date for Track 1 launch or any Track 2 item is stated anywhere.
 - CI (`.github/workflows/ci.yml`) runs tests (Node 20.x/22.x), a coverage-floor check, a chaos/
-  resilience job, and `npm audit`. Its "zero runtime deps" step comments/lockfile-only install will
-  need updating once the SQLite migration adds a real dependency — flagging so that's not missed.
+  resilience job, and `npm audit`. The coverage and chaos jobs now `npm install` before running
+  (they load `server.js`, which requires `better-sqlite3` since ADR-0013); the `security` job stays
+  lockfile-only since it only runs `npm audit`. Actions pinned to `@v5`.
