@@ -31,7 +31,7 @@ is gone. Track 2 (notifications → messaging → Stripe → growth) has not sta
 | Scaling cost optimizations (ADR-0012) | **Done** | `65ced71`; coalesced writes, indexed hot reads, bounded notifications, HTTP caching |
 | `npm run bench` / `npm run loadtest:scale` tooling | **Done** | `43ef219`, `a2164d4`; repeatable before/after + real HTTP numbers |
 | **SQLite migration + `/api/opportunities` pagination (ADR-0013)** | **Done** | Removes the confirmed ~90k-user JSON-string ceiling; verified at 100k users. `npm run migrate:sqlite` for existing `db.json` deployments. Committed `da9a27f`, pushed to `origin/master` |
-| **Security/perf batch (2026-07-04)** | **Done** | WAL-incremental writes, gzip JSON, opportunities page cache, password reset flow, check-in throttle + O(1) index, Discover URL state + Load More. 66 tests. 100k users: 130 → 4,167 req/s. Uncommitted |
+| **Security/perf batch (2026-07-04)** | **Done** | WAL-incremental writes, gzip JSON, opportunities page cache, password reset flow, check-in throttle + O(1) index, Discover URL state + Load More. 66 tests. 100k users: 130 → 4,167 req/s. Committed `05abeb9`, pushed to `origin/master` |
 | Real notifications (Track 2 #1) | **Not started** | See `docs/roadmap.md` |
 | Shift templates + bulk messaging (Track 2 #2) | **Not started** | See `docs/roadmap.md` |
 | Live Stripe billing (Track 2 #3) | **Not started** | Currently DEMO mode (ADR-0004) |
