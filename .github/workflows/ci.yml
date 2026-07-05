@@ -14,8 +14,8 @@ jobs:
       matrix:
         node: ['20.x', '22.x']
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
       - name: Syntax check
@@ -29,8 +29,8 @@ jobs:
     name: Coverage thresholds
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: '22.x'
       - name: Install (better-sqlite3 is a runtime dep, ADR-0013)
@@ -42,8 +42,8 @@ jobs:
     name: Chaos / resilience
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: '22.x'
       - name: Install (better-sqlite3 is a runtime dep, ADR-0013)
@@ -54,8 +54,8 @@ jobs:
     name: Dependency scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: '22.x'
       - name: Generate lockfile (no deps to install)
