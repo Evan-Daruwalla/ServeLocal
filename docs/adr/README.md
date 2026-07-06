@@ -16,3 +16,5 @@ Consequences. Add a new numbered file (don't edit accepted ones; supersede inste
 - [0011 — In-memory indexes over the JSON store](./0011-in-memory-indexes.md)
 - [0012 — Server-cost optimizations for large user counts](./0012-scaling-cost-optimizations.md)
 - [0013 — SQLite persistence (replaces the whole-JSON-file store)](./0013-sqlite-persistence.md)
+- [0014 — Extract the SPA script to /app.js (toward dropping CSP `unsafe-inline`)](./0014-external-spa-script.md)
+- [0015 — Extract pure mechanism (persist/auth/totp) into lib/ modules](./0015-server-module-extraction.md)

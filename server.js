@@ -10,7 +10,11 @@ const path = require('path');
 const crypto = require('crypto');
 const url  = require('url');
 const zlib = require('zlib');
-const Database = require('better-sqlite3');
+const { generateSecret, verifyTotp } = require('./lib/totp');
+const persist = require('./lib/persist');
+const auth = require('./lib/auth');
+const { hashPassword, hashPasswordScrypt, verifyPassword, setPassword, migrateLegacyPassword,
+        weakPassword, timingEqualHex, b64u, makeToken, verifyToken, hashToken } = auth;
 
 // ── LOAD .env FILE ────────────────────────────────
 // Looks for .env in the same folder as server.js
@@ -66,6 +70,7 @@ if (!IS_PROD && ADMIN_PASSWORD === DEFAULT_ADMIN_PASSWORD) {
 }
 // Token lifetime is configurable; default 7 days. Shorter = tighter session window.
 const TOKEN_TTL_MS = (Number(process.env.TOKEN_TTL_HOURS) || 168) * 36e5;
+auth.init({ secret: SECRET, tokenTtlMs: TOKEN_TTL_MS }); // lib/auth.js is pure mechanism; config lives here
 // Guardian-consent one-time approval link lifetime; default 72h.
 const CONSENT_TOKEN_TTL_HOURS = Number(process.env.CONSENT_TOKEN_TTL_HOURS) || 72;
 const CONSENT_TOKEN_TTL_MS = CONSENT_TOKEN_TTL_HOURS * 36e5;
@@ -260,12 +265,17 @@ function idemSet(key, status, body) {
 }
 
 // ── SECURITY HEADERS ──────────────────────────
-// CSP keeps 'unsafe-inline' for script/style because the SPA is intentionally
-// inline-everything (see ADR-0007); everything else is locked down: no external
-// scripts, no framing (clickjacking), no plugins, same-origin connections only.
+// The SPA's JS lives in /app.js (ADR-0014). script-src is now fully locked to
+// 'self' — the ~270 inline event handlers were converted to a delegated
+// dispatch table (data-action/data-args + one document listener per event type,
+// see ACTIONS in public/app.js), so CSP is a real XSS backstop again. style-src
+// keeps 'unsafe-inline' only because the markup still uses hundreds of inline
+// style= attributes (out of scope for ADR-0014 step 2). Everything else is
+// locked down: no external scripts, no framing (clickjacking), no plugins,
+// same-origin connections only.
 const CSP = [
   "default-src 'self'",
-  "script-src 'self' 'unsafe-inline'",
+  "script-src 'self'",
   "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
   "font-src 'self' https://fonts.gstatic.com data:",
   "img-src 'self' data:",
@@ -303,124 +313,27 @@ let DB = Object.fromEntries(DB_COLLECTIONS.map(k => [k, []]));
 let _dbHealthy = true;   // flips false if a save fails — surfaced at /api/health/ready
 let _lastSaveFailure = null;
 
-// SQLite persistence (ADR-0013): each collection is its own table (a primary
-// key column + a JSON `data` column per row). This is a persistence-layer swap
-// ONLY — every DB.<collection> in-memory array and the whole IDX() layer above
-// are untouched; every request still reads/writes plain JS objects exactly as
-// before. The fix targets the one thing ADR-0012 confirmed actually breaks the
-// app at scale: JSON.stringify(DB) building a SINGLE JS string that hits V8's
-// ~512MB string-length cap (~90k users). Serialising per row means no single
-// string ever approaches that limit, however large the DB grows in aggregate.
-const _pk = k => (k === 'auditLog' ? 'seq' : 'id');
-function _openSqlite(file) {
-  const db = new Database(file);
-  try {
-    DB_COLLECTIONS.forEach(k => {
-      const pk = _pk(k);
-      db.exec(`CREATE TABLE IF NOT EXISTS "${k}" (${pk} ${pk === 'seq' ? 'INTEGER' : 'TEXT'} PRIMARY KEY, data TEXT NOT NULL)`);
-    });
-  } catch (e) {
-    // A corrupt/non-sqlite file throws here (on the first schema touch, not the
-    // constructor) — close the handle before rethrowing so Windows releases its
-    // lock immediately. Without this, the caller's recovery rename over this same
-    // path fails with EPERM (found via the chaos harness's corrupt-DB scenario).
-    db.close();
-    throw e;
-  }
-  return db;
-}
-function _readAllFromSqlite(db) {
-  const out = {};
-  DB_COLLECTIONS.forEach(k => {
-    out[k] = db.prepare(`SELECT data FROM "${k}" ORDER BY ${_pk(k)}`).all().map(r => JSON.parse(r.data));
-  });
-  return out;
-}
+// SQLite persistence (ADR-0013): the mechanics — tables, WAL handle, per-row
+// hash mirror, incremental flush — live in lib/persist.js (ADR-0015). This file
+// keeps only the orchestration: WHAT to load/save (the DB object), when to
+// recover from backup or reseed, and the health flags surfaced at
+// /api/health/ready. server.js no longer knows the storage engine.
+persist.init(DB_COLLECTIONS);
 
-// ── Incremental persistence ─────────────────────────────────────────
-// A long-lived WAL-mode handle + a per-row content hash let saveDB() write only
-// rows that actually changed since the last flush, instead of rewriting every
-// row of every table (which at 100k users meant ~760MB of disk I/O per save).
-// WAL replaces the old temp-file+rename dance for crash safety: a torn write
-// can only ever affect the -wal sidecar, never the main file. The hash map is
-// ~20 bytes/row (not a second copy of the DB) and is only replaced after a
-// flush commits, so a failed transaction can't desync it from disk.
-let _sqldb = null;          // persistent handle; null until first successful load/save
-let _rowHashes = null;      // {collection: Map(pk -> sha1)} mirror of what's on disk; null = disk state unknown, rewrite all
-const _rowHash = s => crypto.createHash('sha1').update(s).digest('base64');
-function _openLive(file) {
-  const db = _openSqlite(file);
-  db.pragma('journal_mode = WAL');
-  db.pragma('synchronous = NORMAL'); // fsync on checkpoint, not every commit — WAL keeps commits durable-enough (power-loss window = last checkpoint)
-  return db;
-}
-function _hashAll(db) {
-  const out = {};
-  DB_COLLECTIONS.forEach(k => {
-    out[k] = new Map(db.prepare(`SELECT ${_pk(k)} pk, data FROM "${k}"`).all().map(r => [r.pk, _rowHash(r.data)]));
-  });
-  return out;
-}
-// Flush the in-memory DB to the live handle, writing only changed/new rows and
-// deleting removed ones. With _rowHashes === null (fresh handle, or memory was
-// swapped by a restore) every table is cleared and rewritten.
-function _flushIncremental(db) {
-  const next = {};
-  const work = []; // [{k, upserts:[[pk,json]], deletes:[pk]}]
-  DB_COLLECTIONS.forEach(k => {
-    const prev = _rowHashes && _rowHashes[k];
-    const map = new Map(); const upserts = [];
-    for (const row of DB[k]) {
-      const s = JSON.stringify(row); const pk = row[_pk(k)]; const h = _rowHash(s);
-      map.set(pk, h);
-      if (!prev || prev.get(pk) !== h) upserts.push([pk, s]);
-    }
-    const deletes = [];
-    if (prev) { for (const pk of prev.keys()) if (!map.has(pk)) deletes.push(pk); }
-    next[k] = map;
-    if (upserts.length || deletes.length || !prev) work.push({ k, upserts, deletes, wipe: !prev });
-  });
-  if (work.length) {
-    db.transaction(() => {
-      for (const { k, upserts, deletes, wipe } of work) {
-        const pk = _pk(k);
-        if (wipe) db.prepare(`DELETE FROM "${k}"`).run();
-        const up = db.prepare(`INSERT OR REPLACE INTO "${k}" (${pk}, data) VALUES (?, ?)`);
-        for (const [id, s] of upserts) up.run(id, s);
-        if (deletes.length) { const del = db.prepare(`DELETE FROM "${k}" WHERE ${pk} = ?`); for (const id of deletes) del.run(id); }
-      }
-    })();
-  }
-  _rowHashes = next; // only after commit — a throw above leaves the old mirror intact
-}
-function closeDB() {
-  if (_sqldb) { try { _sqldb.close(); } catch { /* already closed */ } _sqldb = null; _rowHashes = null; }
-}
-function _writeAllToSqlite(db, data) {
-  db.transaction(() => {
-    DB_COLLECTIONS.forEach(k => {
-      const pk = _pk(k);
-      db.prepare(`DELETE FROM "${k}"`).run();
-      const insert = db.prepare(`INSERT INTO "${k}" (${pk}, data) VALUES (?, ?)`);
-      for (const row of data[k]) insert.run(row[pk], JSON.stringify(row));
-    });
-  })();
-}
+function closeDB() { persist.close(); }
 
 function loadDB() {
-  closeDB(); // tests re-load onto a fresh temp file; never hold the previous one open
+  persist.close(); // tests re-load onto a fresh temp file; never hold the previous one open
   try {
     if (fs.existsSync(DB_FILE)) {
-      _sqldb = _openLive(DB_FILE);
-      DB = _readAllFromSqlite(_sqldb);
-      _rowHashes = _hashAll(_sqldb); // mirror of on-disk state -> first flush only writes real changes
+      DB = persist.load(DB_FILE);
       console.log('📂 Database loaded');
     } else {
       seedDB();
     }
   } catch(e) {
     // Graceful degradation: a corrupt db.sqlite must not take the service down.
-    closeDB();
+    persist.close();
     console.error('DB load error:', e.message, '— attempting newest backup, else reseeding');
     // Persist the recovered state back to the primary file so disk is healthy
     // again immediately (not left corrupt until the next write). seedDB() already saves.
@@ -429,31 +342,14 @@ function loadDB() {
   }
 }
 
-// Persist the in-memory DB. Normal path: incremental flush over the live WAL
-// handle (only changed rows touch disk). Fallback path (no healthy handle —
-// first boot, or the primary file was corrupt): build a fresh sqlite file at a
-// temp path and atomically rename it over the primary, then adopt it as the
-// live handle. A failed save degrades gracefully — we keep serving from memory
-// and flag readiness rather than crashing.
+// Persist the in-memory DB (incremental over the live WAL handle, or full
+// temp-file+rename fallback — see lib/persist.js). A failed save degrades
+// gracefully — we keep serving from memory and flag readiness rather than crashing.
 function saveDB() {
   // An explicit save persists everything, so cancel any pending coalesced flush.
   _saveDirty = false; if (_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null; }
   try {
-    if (!_sqldb) {
-      const tmp = DB_FILE + '.' + process.pid + '.tmp';
-      if (fs.existsSync(tmp)) fs.rmSync(tmp);
-      const db = _openSqlite(tmp);
-      _writeAllToSqlite(db, DB);
-      db.close();
-      // A leftover -wal/-shm from the file being replaced must not be paired
-      // with the fresh file (SQLite would try to replay the stale WAL into it).
-      for (const ext of ['-wal', '-shm']) { try { fs.rmSync(DB_FILE + ext, { force: true }); } catch { /* best effort */ } }
-      fs.renameSync(tmp, DB_FILE);
-      _sqldb = _openLive(DB_FILE);
-      _rowHashes = _hashAll(_sqldb);
-    } else {
-      _flushIncremental(_sqldb);
-    }
+    persist.save(DB_FILE, DB);
     _dbHealthy = true; _lastSaveFailure = null;
     bumpCache(); // any write invalidates read caches
   } catch (e) {
@@ -484,7 +380,7 @@ function backupSnapshot() {
     if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
     // WAL keeps recent commits in the -wal sidecar; checkpoint first so the
     // main file alone is a complete snapshot (a bare copyFileSync would miss them).
-    if (_sqldb) { try { _sqldb.pragma('wal_checkpoint(TRUNCATE)'); } catch { /* copy still valid, just older */ } }
+    persist.checkpoint();
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const dest = path.join(BACKUP_DIR, `db-${stamp}.sqlite`);
     fs.copyFileSync(DB_FILE, dest);
@@ -501,9 +397,7 @@ function restoreFromBackup() {
     while (snaps.length) {
       const latest = snaps.pop();
       try {
-        const db = _openSqlite(path.join(BACKUP_DIR, latest));
-        DB = _readAllFromSqlite(db);
-        db.close();
+        DB = persist.readBackup(path.join(BACKUP_DIR, latest));
         console.log('♻️  Restored database from backup', latest);
         return true;
       } catch { /* try the next-older snapshot */ }
@@ -678,6 +572,13 @@ function iso() { return new Date().toISOString(); }
 
 function createNotification(userId, type, title, message, link='') {
   DB.notifications.push({ id:uid(), userId, type, title, message, link, read:false, createdAt:iso() });
+  // Track 2 #1: email delivery on top of the in-app record. Opt-out via the
+  // profile toggle (emailNotifications === false); default is on. sendEmail is
+  // fire-and-forget and a dev stub without RESEND_API_KEY, so this never blocks.
+  const u = IDX().userById.get(userId);
+  if (u && u.email && u.emailNotifications !== false) {
+    sendEmail(u.email, title, message + '\n\nView on ServeLocal: ' + PUBLIC_BASE_URL);
+  }
 }
 
 // When a spot frees up on a full one-time event, the earliest waitlisted
@@ -700,81 +601,10 @@ function promoteFromWaitlist(opp) {
   createNotification(wl.userId, 'waitlist_promoted', "You're In! 🎉", 'A spot opened up for "'+opp.title+'" — you\'ve been moved off the waitlist and signed up.', 'dash');
 }
 
-// ── PASSWORD HASHING (scrypt — slow KDF, OWASP-recommended) ──
-// New hashes use scrypt and are self-describing: "scrypt$N$r$p$salt$hash".
-// Legacy HMAC-SHA256 hashes are still verified and transparently upgraded on
-// the user's next successful login (see migrateLegacyPassword).
-const SCRYPT_N = Number(process.env.SCRYPT_N) || 32768; // 2^15; raise in prod via env
-const SCRYPT_PARAMS = { N: SCRYPT_N, r: 8, p: 1, maxmem: 256 * 1024 * 1024 };
-function hashPassword(pw, salt) { // legacy (kept for migration + verification only)
-  return crypto.createHmac('sha256', salt).update(pw).digest('hex');
-}
-function hashPasswordScrypt(pw, salt = crypto.randomBytes(16).toString('hex'), N = SCRYPT_N) {
-  const h = crypto.scryptSync(pw, salt, 64, { ...SCRYPT_PARAMS, N }).toString('hex');
-  return `scrypt$${N}$${SCRYPT_PARAMS.r}$${SCRYPT_PARAMS.p}$${salt}$${h}`;
-}
-// Constant-time hex compare (avoids timing side-channels). Returns false on length mismatch.
-function timingEqualHex(a, b) {
-  try { const ba = Buffer.from(String(a), 'hex'), bb = Buffer.from(String(b), 'hex');
-    return ba.length === bb.length && crypto.timingSafeEqual(ba, bb); } catch { return false; }
-}
-// Verify a plaintext password against a stored credential (scrypt or legacy).
-function verifyPassword(pw, user) {
-  const stored = user.passwordHash || '';
-  if (stored.startsWith('scrypt$')) {
-    const [, N, r, p, salt, hash] = stored.split('$');
-    const calc = crypto.scryptSync(pw, salt, 64, { N: +N, r: +r, p: +p, maxmem: SCRYPT_PARAMS.maxmem }).toString('hex');
-    return timingEqualHex(calc, hash);
-  }
-  // legacy HMAC-SHA256 with the per-user salt field
-  return timingEqualHex(hashPassword(pw, user.salt), stored);
-}
-// Set/replace a user's password with a fresh scrypt hash.
-function setPassword(user, pw) { user.salt = crypto.randomBytes(16).toString('hex'); user.passwordHash = hashPasswordScrypt(pw, user.salt); }
-// Upgrade a legacy hash to scrypt after a verified login (called with plaintext).
-function migrateLegacyPassword(user, pw) { if (!(user.passwordHash || '').startsWith('scrypt$')) { setPassword(user, pw); return true; } return false; }
-
-// ── WEAK PASSWORD DENYLIST ────────────────────
-// Small bundled list of the most-common passwords; blocks the worst offenders
-// at registration / change without a network call (zero-dependency).
-const COMMON_PASSWORDS = new Set([
-  'password','password1','password123','12345678','123456789','1234567890','qwerty123','qwertyuiop',
-  'iloveyou','admin123','welcome1','letmein1','abc12345','11111111','00000000','football','baseball',
-  'sunshine','princess','dragon123','monkey123','passw0rd','trustno1','superman','starwars','michael1',
-  'changeme','servelocal','volunteer','student1','password!','p@ssword','qwerty12','asdfghjkl',
-]);
-function weakPassword(pw, email) {
-  const p = String(pw || '').toLowerCase();
-  if (COMMON_PASSWORDS.has(p)) return true;
-  if (/^(.)\1+$/.test(p)) return true;                 // all one character
-  if (/^(0123456789|1234567890|abcdefgh)/.test(p)) return true; // obvious sequences
-  const local = String(email || '').split('@')[0].toLowerCase();
-  if (local && local.length >= 4 && p.includes(local)) return true; // contains the email name
-  return false;
-}
-
-// ── AUTH HELPERS ──────────────────────────────
-function makeToken(user) {
-  const h = b64u(JSON.stringify({alg:'HS256',typ:'JWT'}));
-  // tv = token version: bumping user.tokenVersion invalidates all prior tokens
-  // (logout-everywhere / forced revocation on suspend).
-  const p = b64u(JSON.stringify({sub:user.id,role:user.role,tv:user.tokenVersion||0,iat:Date.now(),exp:Date.now()+TOKEN_TTL_MS}));
-  const s = crypto.createHmac('sha256',SECRET).update(`${h}.${p}`).digest('base64url');
-  return `${h}.${p}.${s}`;
-}
-function verifyToken(token) {
-  try {
-    const [h,p,s] = token.split('.');
-    const exp = crypto.createHmac('sha256',SECRET).update(`${h}.${p}`).digest('base64url');
-    // Constant-time signature comparison (avoids timing oracle on the HMAC).
-    const sb = Buffer.from(String(s)), eb = Buffer.from(exp);
-    if (sb.length !== eb.length || !crypto.timingSafeEqual(sb, eb)) return null;
-    const d = JSON.parse(Buffer.from(p,'base64url').toString());
-    if (d.exp < Date.now()) return null;
-    return d;
-  } catch { return null; }
-}
-function b64u(str) { return Buffer.from(str).toString('base64url'); }
+// Password hashing (scrypt), weak-password denylist, and HMAC-JWT token
+// mechanics live in lib/auth.js (ADR-0015) and are destructured at the top of
+// this file. getUser()/safeUser() stay here because they depend on IDX() and
+// this file's domain field shapes, not just crypto primitives.
 function getUser(req) {
   const auth = req.headers['authorization']||'';
   const token = auth.replace('Bearer ','');
@@ -789,7 +619,8 @@ function getUser(req) {
 }
 function safeUser(u) {
   if (!u) return null;
-  const {passwordHash,salt,resetTokenHash,resetTokenExpires,...rest} = u;
+  const {passwordHash,salt,resetTokenHash,resetTokenExpires,
+         mfaSecret,mfaPendingSecret,mfaBackupCodes,mfaLoginTokenHash,mfaLoginExpires,...rest} = u;
   return rest;
 }
 
@@ -805,6 +636,18 @@ function publicOpp(o) {
 const loginAttempts = new Map();
 function loginThrottleKey(req, email) {
   return (req.socket?.remoteAddress||'unknown')+'|'+String(email||'').toLowerCase();
+}
+
+// MFA acceptance: live TOTP first, else a one-time backup code (consumed on use).
+function mfaCodeOk(u, rawCode) {
+  const code = String(rawCode||'').trim();
+  if (u.mfaSecret && verifyTotp(u.mfaSecret, code)) return true;
+  if (Array.isArray(u.mfaBackupCodes) && /^[a-f0-9]{10}$/i.test(code)) {
+    const h = hashToken(code.toLowerCase());
+    const i = u.mfaBackupCodes.indexOf(h);
+    if (i !== -1) { u.mfaBackupCodes.splice(i, 1); return true; }
+  }
+  return false;
 }
 
 
@@ -861,7 +704,7 @@ function generateCode() {
 // apply to an opportunity, message an org, redeem a check-in code, or be endorsed.
 // 18+ students are never gated. Age is recomputed live (not cached) so a student
 // who ages into adulthood while a request is pending is unblocked automatically.
-function hashToken(token) { return crypto.createHash('sha256').update(token).digest('hex'); }
+// (hashToken moved to lib/auth.js — imported at the top of this file.)
 function studentAge(dob) { return (Date.now() - new Date(dob)) / (365.25 * 864e5); }
 function requireGuardianConsent(user) {
   if (!user || user.role !== 'student') return null; // orgs/admin unaffected
@@ -1191,6 +1034,16 @@ async function router(req, res) {
     loginAttempts.delete(throttleKey);
     // Transparently upgrade legacy HMAC password hashes to scrypt on login.
     const upgraded = migrateLegacyPassword(found, password);
+    if (found.mfaEnabled) {
+      // Password OK but MFA required: no session yet. Issue a short-lived,
+      // single-use ticket (stored hashed, like reset tokens) that only
+      // /api/auth/mfa/verify can redeem.
+      const t = crypto.randomBytes(32).toString('hex');
+      found.mfaLoginTokenHash = hashToken(t);
+      found.mfaLoginExpires = new Date(Date.now()+5*60*1000).toISOString();
+      appendAudit(found.id,'auth.login.mfa_challenge','',{ip}); saveDB();
+      return json(res,{mfaRequired:true,mfaToken:t});
+    }
     appendAudit(found.id,'auth.login.success','',{ip,role:found.role,upgraded}); saveDB();
     return json(res,{token:makeToken(found),user:safeUser(found)});
   }
@@ -1237,6 +1090,77 @@ async function router(req, res) {
     u.tokenVersion = (u.tokenVersion||0)+1; // revoke every existing session
     appendAudit(u.id,'auth.password_reset','',{ip}); saveDB();
     return json(res,{ok:true,message:'Password updated. You can now log in.'});
+  }
+
+  // ── MFA (TOTP, RFC 6238 — zero-dep lib/totp.js) ──────────────────────────
+  // POST /api/auth/mfa/setup — start enrollment: returns secret + otpauth URI.
+  // Secret stays pending (unusable for login) until confirmed via /enable.
+  if (method==='POST' && p==='/api/auth/mfa/setup') {
+    if (!user) return json(res,{error:'Unauthorized'},401);
+    const me = IDX().userById.get(user.id);
+    if (me.mfaEnabled) return json(res,{error:'MFA is already enabled'},409);
+    me.mfaPendingSecret = generateSecret();
+    const label = encodeURIComponent('ServeLocal:'+me.email);
+    const otpauth = `otpauth://totp/${label}?secret=${me.mfaPendingSecret}&issuer=ServeLocal&digits=6&period=30`;
+    saveDB();
+    return json(res,{secret:me.mfaPendingSecret,otpauth});
+  }
+
+  // POST /api/auth/mfa/enable — confirm enrollment with a live code.
+  // Returns one-time-visible backup codes (stored only as sha256 hashes).
+  if (method==='POST' && p==='/api/auth/mfa/enable') {
+    if (!user) return json(res,{error:'Unauthorized'},401);
+    const me = IDX().userById.get(user.id);
+    if (!me.mfaPendingSecret) return json(res,{error:'Start setup first'},400);
+    if (!verifyTotp(me.mfaPendingSecret, body.code))
+      return json(res,{error:'That code is not valid. Check your authenticator app and try again.'},400);
+    me.mfaSecret = me.mfaPendingSecret;
+    delete me.mfaPendingSecret;
+    me.mfaEnabled = true;
+    const backupCodes = Array.from({length:8},()=>crypto.randomBytes(5).toString('hex'));
+    me.mfaBackupCodes = backupCodes.map(hashToken);
+    appendAudit(me.id,'auth.mfa_enabled','',{ip}); saveDB();
+    return json(res,{ok:true,backupCodes});
+  }
+
+  // POST /api/auth/mfa/disable — requires a live TOTP or backup code.
+  // Revokes all sessions (same posture as password change).
+  if (method==='POST' && p==='/api/auth/mfa/disable') {
+    if (!user) return json(res,{error:'Unauthorized'},401);
+    const me = IDX().userById.get(user.id);
+    if (!me.mfaEnabled) return json(res,{error:'MFA is not enabled'},400);
+    if (!mfaCodeOk(me, body.code))
+      return json(res,{error:'That code is not valid.'},400);
+    me.mfaEnabled = false;
+    delete me.mfaSecret; delete me.mfaBackupCodes; delete me.mfaPendingSecret;
+    me.tokenVersion = (me.tokenVersion||0)+1;
+    appendAudit(me.id,'auth.mfa_disabled','',{ip}); saveDB();
+    return json(res,{ok:true,message:'MFA disabled. Please log in again.'});
+  }
+
+  // POST /api/auth/mfa/verify — second login step: redeem the ticket + code.
+  if (method==='POST' && p==='/api/auth/mfa/verify') {
+    const t = String(body.mfaToken||''); const code = String(body.code||'');
+    if (!t || !code) return json(res,{error:'Code required'},400);
+    const th = hashToken(t);
+    const u = DB.users.find(x=>x.mfaLoginTokenHash && x.mfaLoginTokenHash===th);
+    if (!u || !u.mfaLoginExpires || new Date(u.mfaLoginExpires) < new Date())
+      return json(res,{error:'Login session expired. Please log in again.'},401);
+    const throttleKey = 'mfa|'+u.id;
+    const attempts = loginAttempts.get(throttleKey);
+    if (attempts && Date.now()-attempts.first >= 15*60*1000) loginAttempts.delete(throttleKey);
+    else if (attempts && attempts.count >= 8)
+      return json(res,{error:'Too many failed codes. Please try again in 15 minutes.'},429);
+    if (!mfaCodeOk(u, code)) {
+      const rec = loginAttempts.get(throttleKey)||{count:0,first:Date.now()};
+      rec.count++; loginAttempts.set(throttleKey,rec);
+      appendAudit(u.id,'auth.mfa.fail','',{ip}); saveDB();
+      return json(res,{error:'That code is not valid.'},401);
+    }
+    loginAttempts.delete(throttleKey);
+    u.mfaLoginTokenHash = ''; u.mfaLoginExpires = null; // single-use
+    appendAudit(u.id,'auth.login.success','',{ip,role:u.role,mfa:true}); saveDB();
+    return json(res,{token:makeToken(u),user:safeUser(u)});
   }
 
   // POST /api/auth/signout-all — revoke every existing session for this user
@@ -2032,6 +1956,7 @@ async function router(req, res) {
   if (method==='PUT' && p==='/api/profile') {
     if (!user) return json(res,{error:'Unauthorized'},401);
     const idx = DB.users.findIndex(u=>u.id===user.id);
+    if (body.emailNotifications!==undefined) DB.users[idx].emailNotifications = !!body.emailNotifications;
     if (user.role==='student') {
       ['school','grade','location','skills','causes'].forEach(k=>{ if(body[k]!==undefined) DB.users[idx][k]=body[k]; });
       if (body.hoursGoal!==undefined) DB.users[idx].hoursGoal = Math.max(0,Math.min(10000,Number(body.hoursGoal)||0));
@@ -3142,7 +3067,7 @@ module.exports = {
   start, buildServer, router, loadDB, saveDB, closeDB, seedDB, backupSnapshot, restoreFromBackup, retentionPurge,
   appendAudit, verifyAuditChain, makeToken, verifyToken, hashPassword, hashPasswordScrypt, verifyPassword, setPassword, weakPassword, publicOpp, sstr, clampNum, isEmail,
   calcHours, isValidOccurrence, nextOccurrenceAfter, orgPlan, rateLimit, makeBreaker,
-  IDX, idxList, bumpCache, saveDBSoon,
+  IDX, idxList, bumpCache, saveDBSoon, createNotification,
   get DB(){ return DB; }, set DB(v){ DB = v; },
   PLANS, AWARDS,
 };

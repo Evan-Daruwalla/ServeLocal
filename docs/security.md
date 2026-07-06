@@ -11,6 +11,8 @@ script, or policy). "Code" entries cite `server.js` / `public/index.html`; "Test
 | 1 | **Input sanitization & injection prevention** | ✅ Code + Test | Server: `sstr()`/`clampNum()`/`isEmail()` sanitize at write time (titles, descriptions, messages, reviews, donations). Client: `esc()` (HTML, incl. `'`), `jsq()` (JS-string contexts), `safeHref()` (blocks `javascript:`). No SQL (JSON store). Static serving is path-traversal-safe (`serveStatic` resolves + contains to `public/`). Tests: `unit.test.js`, `integration.test.js` (leak/escape), `regression.test.js` (incl. `../` traversal → 404). |
 | 2 | **AuthN, AuthZ, roles & permissions** | ✅ Code + Test | **scrypt** password hashing (`hashPasswordScrypt`/`verifyPassword`, OWASP-recommended slow KDF) with transparent migration of legacy HMAC hashes on login; **constant-time** comparisons (`timingSafeEqual`) for passwords and token signatures; **weak-password denylist** at register/change; password-change flow (`POST /api/account/password`). HMAC-JWT (`makeToken`/`verifyToken`/`getUser`); roles `student`/`org`/`admin`; `requireRole()` + per-handler ownership checks; multi-tenant isolation by `orgId`/`userId`. Tests: scrypt round-trip, weak-pw, password-change, RBAC, tenant isolation. |
 | 3 | **Session management & token expiry** | ✅ Code | Configurable TTL (`TOKEN_TTL_HOURS`, default 7d); `iat`/`exp` claims; `tokenVersion` revocation; `POST /api/auth/signout-all`; suspend and password-change bump the version. Client auto-logs-out on 401. Test: `signout-all` + `password change ... revokes other sessions`. |
+| 3b | **Password reset (self-service)** | ✅ Code + Test | `POST /api/auth/forgot` + `POST /api/auth/reset`: sha256-hashed single-use token, 1-hour TTL, anti-enumeration (identical 200 for known/unknown emails), throttled 3/15 min per IP+email, weak-password denylist on the new password, `tokenVersion` bump revokes all sessions, audited. `safeUser()` never serializes token fields. Tests: `test/password-reset.test.js` (5 cases). |
+| 3c | **MFA (TOTP, RFC 6238)** | ✅ Code + Test | Zero-dep `lib/totp.js` (HMAC-SHA1, 6 digits, 30s, ±1 drift, constant-time compare). Enrollment: `mfa/setup` (pending secret + otpauth URI) → `mfa/enable` (live-code confirm; 8 one-time backup codes stored sha256-hashed, shown once). Login becomes two-step: password → hashed single-use 5-min ticket → `mfa/verify` (throttled 8/15 min). Disable requires a valid code and revokes all sessions. Secrets never serialized (`safeUser`). Tests: `test/mfa.test.js` (6 cases). |
 | 4 | **Secrets management** | ✅ Code + Policy | `.env` loader; **prod refuses to boot on default `JWT_SECRET` or default `ADMIN_PASSWORD`** (seeded admin password is public in source); credentials printed to boot log in dev only; `.env.example`; `.gitignore` excludes `.env`/`*.pem`. Rotation notes in `.env.example` & DR doc. Test: `regression.test.js` (prod boot refused with default admin password). |
 | 5 | **HTTPS / TLS / cert rotation** | ✅ Code + Deploy | Optional direct TLS via `SSL_CERT`/`SSL_KEY` (`buildServer`); HSTS header in prod; rotation = replace PEMs + restart, or terminate at proxy (Railway auto-TLS, `DEPLOY.txt` §3). |
 | 6 | **Rate limiting & abuse prevention** | ✅ Code + Test | Per-IP token bucket (`rateLimit`, tighter for writes) + login throttle (8/15 min). Tests: burst → 429; load/chaos scripts exercise it. |
@@ -60,11 +62,8 @@ risk, not an oversight:
   session tokens in `localStorage`. We mitigate the underlying XSS heavily (output escaping +
   CSP), so this is residual risk. Moving to an HttpOnly refresh cookie changes the auth model and
   reintroduces CSRF handling; tracked as a future task.
-- **MFA / TOTP (especially for admin).** Implementable zero-dependency with `crypto` (RFC 6238)
-  but needs an enrollment UI + recovery codes. High value for the admin account; planned next.
-- **Password reset via email.** Depends on the Resend email path being enabled (currently
-  stubbed). Authenticated password *change* is implemented now; self-service *reset* lands with
-  email. CAPTCHA/bot-defense on signup similarly needs a third-party and is deferred.
+- **CAPTCHA / bot-defense on signup.** Needs a third-party service; deferred. (Password reset and
+  MFA/TOTP — formerly listed here — shipped 2026-07-04/05: see controls 3b and 3c.)
 
 ## Reporting a vulnerability
 

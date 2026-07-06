@@ -7,6 +7,8 @@ db.json
 db.json.*.tmp
 db.sqlite
 db.sqlite.*.tmp
+db.sqlite-wal
+db.sqlite-shm
 backups/
 
 # Dependencies (better-sqlite3, ADR-0013 — a documented ADR-0001 exception)

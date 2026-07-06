@@ -1,6 +1,8 @@
 # ADR-0007: Content-Security-Policy retains `unsafe-inline` for the inline SPA
 
-**Status:** Accepted (with a planned tightening path)
+**Status:** Accepted (with a planned tightening path) — partially superseded by
+[ADR-0014](./0014-external-spa-script.md): the inline `<script>` blocks moved to `/app.js`
+(2026-07-05); `'unsafe-inline'` now remains only for inline event handlers and `style=`.
 
 ## Context
 The frontend is intentionally a single `index.html` with inline `<style>`, inline `<script>`,
