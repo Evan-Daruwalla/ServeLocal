@@ -57,6 +57,10 @@ email delivery (the first slice of Track 2 #1), TOTP MFA, extracting the SPA scr
 - Not deployed to production. `https://servelocal.org` in meta tags is aspirational.
 
 ## Documentation
+- `../docs/Project Record — Full Chronological History.md` — **whole-project** (v1 + v2)
+  consolidated chronological record spanning both eras, updated on every medium-or-larger change
+  (rendered HTML twin via `python -m scripts.render_record_html` from the ServeLocal root). v1 is
+  frozen there as the behavioral reference; the files below remain the fine-grained v1 sources.
 - `docs/record_2026-07-02.md` — append-only, timestamped build log (the "why" and "how", including
   abandoned approaches and bugs found). Never edited retroactively.
 - `docs/state_2026-07-03.md` — current architecture/status snapshot. New dated file when scope

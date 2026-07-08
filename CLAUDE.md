@@ -96,9 +96,10 @@ ServeLocal website/
 ```
 
 Root also has `CONTRIBUTING.md`, `SECURITY.md`, `DEPLOY.txt` (a manual deploy runbook — the app is
-NOT deployed; `https://servelocal.org` in meta tags is aspirational). Project skills in
-`.claude/skills/` (api-design, security-review, frontend-a11y, emil-design-eng, review-animations,
-ui-ux-pro-max) — use them when their trigger applies.
+NOT deployed; `https://servelocal.org` in meta tags is aspirational). Project skills: `ui-ux-pro-max`
+in `.claude/skills/`; api-design, security-review, frontend-a11y, emil-design-eng, and
+review-animations moved to the repo root's `../.claude/skills/` (2026-07-08) so v2 can use them too —
+they still apply here. Use them when their trigger applies.
 
 ## Key Concepts
 
