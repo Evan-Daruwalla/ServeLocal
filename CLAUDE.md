@@ -199,6 +199,8 @@ fields: checkinCodes, views, orgEmail, etc.).
   UTF-16/BOM encoding corrupts emoji and multibyte content. Use Node scripts or jq.
 - Inline `node -e` with arrow functions + nested quotes is flaky in this shell and can leave 0-byte
   junk files in the repo root (harmless, never commit them). Prefer a temp `.js` file or jq.
+- Run `date` before writing ANY timestamp; never estimate it. Label the zone by the UTC offset
+  `date` reports: **UTC-6 → CST, UTC-5 → CDT** (Central, DST-aware).
 
 ## Documentation cadence
 
