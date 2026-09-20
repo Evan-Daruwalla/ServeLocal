@@ -8,7 +8,7 @@ script, or policy). "Code" entries cite `server.js` / `public/index.html`; "Test
 
 | # | Control | Status | Where it lives |
 |---|---|---|---|
-| 1 | **Input sanitization & injection prevention** | ✅ Code + Test | Server: `sstr()`/`clampNum()`/`isEmail()` sanitize at write time (titles, descriptions, messages, reviews, donations). Client: `esc()` (HTML, incl. `'`), `jsq()` (JS-string contexts), `safeHref()` (blocks `javascript:`). No SQL (JSON store). Static serving is path-traversal-safe (`serveStatic` resolves + contains to `public/`). Tests: `unit.test.js`, `integration.test.js` (leak/escape), `regression.test.js` (incl. `../` traversal → 404). |
+| 1 | **Input sanitization & injection prevention** | ✅ Code + Test | Server: `sstr()`/`clampNum()`/`isEmail()` sanitize at write time (titles, descriptions, messages, reviews, donations). Client: `esc()` (HTML, incl. `'`), `safeHref()` (blocks `javascript:`), plus the data-args dispatch table (ADR-0014). `jsq()` is retired -- defined but with zero call sites. No SQL (JSON store). Static serving is path-traversal-safe (`serveStatic` resolves + contains to `public/`). Tests: `unit.test.js`, `integration.test.js` (leak/escape), `regression.test.js` (incl. `../` traversal → 404). |
 | 2 | **AuthN, AuthZ, roles & permissions** | ✅ Code + Test | **scrypt** password hashing (`hashPasswordScrypt`/`verifyPassword`, OWASP-recommended slow KDF) with transparent migration of legacy HMAC hashes on login; **constant-time** comparisons (`timingSafeEqual`) for passwords and token signatures; **weak-password denylist** at register/change; password-change flow (`POST /api/account/password`). HMAC-JWT (`makeToken`/`verifyToken`/`getUser`); roles `student`/`org`/`admin`; `requireRole()` + per-handler ownership checks; multi-tenant isolation by `orgId`/`userId`. Tests: scrypt round-trip, weak-pw, password-change, RBAC, tenant isolation. |
 | 3 | **Session management & token expiry** | ✅ Code | Configurable TTL (`TOKEN_TTL_HOURS`, default 7d); `iat`/`exp` claims; `tokenVersion` revocation; `POST /api/auth/signout-all`; suspend and password-change bump the version. Client auto-logs-out on 401. Test: `signout-all` + `password change ... revokes other sessions`. |
 | 3b | **Password reset (self-service)** | ✅ Code + Test | `POST /api/auth/forgot` + `POST /api/auth/reset`: sha256-hashed single-use token, 1-hour TTL, anti-enumeration (identical 200 for known/unknown emails), throttled 3/15 min per IP+email, weak-password denylist on the new password, `tokenVersion` bump revokes all sessions, audited. `safeUser()` never serializes token fields. Tests: `test/password-reset.test.js` (5 cases). |
@@ -43,7 +43,7 @@ script, or policy). "Code" entries cite `server.js` / `public/index.html`; "Test
 
 - **Assets:** student PII (name, DOB, school), verified-hours records, org accounts, auth secret.
 - **Primary threats & mitigations:**
-  - *Stored XSS* → output escaping (`esc`/`jsq`) + input sanitization + CSP.
+  - *Stored XSS* → output escaping (`esc`) + the data-args dispatch pattern + input sanitization + CSP (`script-src 'self'`).
   - *IDOR / data leakage* → ownership checks on every resource + `publicOpp()` field stripping.
   - *Privilege escalation* → `requireRole()` + role checks; suspend revokes tokens.
   - *Credential stuffing / brute force* → login throttle + global rate limit.

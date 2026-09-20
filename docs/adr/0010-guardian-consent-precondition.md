@@ -1,6 +1,9 @@
 # ADR-0010: Guardian consent is a precondition, not a feature
 
-**Status:** Accepted
+**Status:** Accepted. *(Note added 2026-09-19: the `server.js:820-821` citation in
+Context below has drifted -- the 12+ age floor now sits near line 940. The decision
+body is left unedited per `docs/adr/README.md`: accepted ADRs are superseded, not
+rewritten. The behaviour it describes is unchanged.)*
 
 ## Context
 Student registration only enforces a 12+ floor (`server.js:820-821`), no ceiling — so the

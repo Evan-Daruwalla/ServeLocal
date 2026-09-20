@@ -18,7 +18,9 @@ npm run backup              # snapshot db.sqlite
 ## Definition of done (every PR)
 1. `npm test` and `npm run coverage:check` pass.
 2. New user input is **sanitized server-side** (`sstr`/`clampNum`) and **escaped on render**
-   (`esc`/`jsq`/`safeHref`). Never interpolate raw user text into an inline `onclick`.
+   (`esc`/`safeHref`). `jsq()` is RETIRED -- it still exists in `app.js` but has no call
+   sites; don't use it for new code (ADR-0014 replaced handler-site escaping with the
+   data-args dispatch table). Never interpolate raw user text into an inline `onclick`.
 3. New endpoints enforce **auth + role + tenant ownership**. Any endpoint returning
    opportunities to non-owners must pass them through `publicOpp()`.
 4. Security-relevant actions call `appendAudit(actor, action, target, meta)`.

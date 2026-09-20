@@ -8,7 +8,7 @@ free forever; revenue comes from organization Pro plans and community donations.
 ```mermaid
 flowchart TB
   subgraph Client["Browser (single-page app)"]
-    SPA["public/index.html<br/>HTML + CSS + vanilla JS<br/>hash router, api() wrapper<br/>(retry/backoff, idempotency,<br/>session-expiry handling)"]
+    SPA["public/index.html (shell + CSS)<br/>public/app.js (all JS, ADR-0014)<br/>hash router, api() wrapper<br/>(retry/backoff, idempotency,<br/>session-expiry handling)"]
   end
 
   subgraph Server["Node.js process (server.js, one runtime dep: better-sqlite3)"]
@@ -40,7 +40,7 @@ flowchart TB
 
 | Layer | File | Responsibility |
 |---|---|---|
-| SPA | `public/index.html` | Entire frontend: views, hash routing, resilient `api()` client, accessibility |
+| SPA | `public/index.html` + `public/app.js` | Frontend: shell and CSS in the HTML, all JS in `app.js` since ADR-0014; views, hash routing, resilient `api()` client, accessibility |
 | HTTP server | `server.js` | Routing, auth, RBAC, all business logic, persistence, background jobs |
 | Persistence | `db.sqlite` (+ `backups/`) | One SQLite table per collection, loaded fully into memory at boot; atomic temp-file + rename writes (ADR-0013) |
 | Tests | `test/` | `unit`, `integration` (in-process HTTP), `regression` via Node's built-in runner |
@@ -72,6 +72,9 @@ See the Architecture Decision Records in [`docs/adr/`](./adr/). Highlights:
 - **ADR-0006** In-memory token-bucket rate limiting + circuit breaker for external calls.
 - **ADR-0007** CSP retains `unsafe-inline` for the intentionally inline-everything SPA.
 - **ADR-0008** Coarse cache invalidation: every write bumps a global cache version.
+- **ADR-0014** Extract the SPA script to `/app.js` — the first step toward dropping
+  CSP `'unsafe-inline'`; `script-src` is now `'self'` (`server.js`).
+- **ADR-0015** Extract pure mechanism from `server.js` into `lib/` modules.
 - **ADR-0013** SQLite persistence (replaces the whole-JSON-file store) + `/api/opportunities`
   pagination — removes the confirmed ~90k-user serialization ceiling from ADR-0012's load testing.
 

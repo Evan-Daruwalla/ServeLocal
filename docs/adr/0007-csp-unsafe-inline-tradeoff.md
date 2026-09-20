@@ -2,7 +2,10 @@
 
 **Status:** Accepted (with a planned tightening path) — partially superseded by
 [ADR-0014](./0014-external-spa-script.md): the inline `<script>` blocks moved to `/app.js`
-(2026-07-05); `'unsafe-inline'` now remains only for inline event handlers and `style=`.
+(2026-07-05) and the inline `onclick=` handlers became a data-args dispatch table, so
+`script-src` is now `'self'` with NO `'unsafe-inline'` at all; it remains only on
+`style-src`. (Status line corrected 2026-09-19; the decision body below is unchanged and
+describes the pre-ADR-0014 state on purpose.)
 
 ## Context
 The frontend is intentionally a single `index.html` with inline `<style>`, inline `<script>`,

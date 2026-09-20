@@ -50,6 +50,7 @@
 - **Filters:** by skill, cause, date, and time commitment.
 - **Distance / "near you":** real-time distance from the user's **live geolocation** *or* a typed ZIP code (haversine distance, privacy-rounded coordinates).
 - **Featured listings** sort to the top (Pro orgs).
+- **Personalised recommendations** (`GET /api/recommendations`, rendered by `app.js`): ranks open opportunities against the student's skills, causes and past commitments. *(Added to this inventory 2026-09-19 -- the endpoint shipped undocumented.)*
 - Opportunity detail view (description, schedule, spots remaining, org info).
 - Per-date spot availability for recurring events.
 - **Bookmarks / Saved** — heart an opportunity; "Saved" tab in the student dashboard.
@@ -189,13 +190,17 @@
 
 - **Auth:** scrypt password hashing (legacy HMAC auto-upgrades on login), HMAC-JWT tokens with TTL + `tokenVersion` revocation, constant-time comparisons, weak-password denylist.
 - **Authorization:** roles (`student`/`org`/`admin`), per-handler ownership checks, multi-tenant isolation, `publicOpp()` strips org-internal fields from public responses.
-- **Input/output safety:** server-side sanitization (`sstr`/`clampNum`/`isEmail`); client escaping (`esc`/`jsq`/`safeHref`); CSP + full security headers; **path-traversal-safe** static serving.
+- **Input/output safety:** server-side sanitization (`sstr`/`clampNum`/`isEmail`); client escaping (`esc`/`safeHref`; `jsq` retired, zero call sites); CSP + full security headers; **path-traversal-safe** static serving.
 - **Abuse prevention:** per-IP rate limiting (token bucket) + login throttle.
 - **Resilience:** atomic DB writes (temp + rename), 30-min backup snapshots, corrupt-DB recovery/reseed, graceful degradation (`/api/health` + `/api/health/ready`), circuit breaker, retry/backoff, **idempotency keys** on mutating routes.
 - **Privacy/compliance:** PII minimization, hourly retention purge, GDPR export & erasure; documented HIPAA out-of-scope.
 - **Secrets:** prod refuses to boot on default `JWT_SECRET` or default `ADMIN_PASSWORD`; CORS lockdown via `ALLOWED_ORIGINS`; optional direct TLS + HSTS.
 - **Quality:** unit / integration / regression test suites, coverage thresholds, load & chaos scripts, CI with `npm audit`, Dependabot, zero runtime dependencies.
-- **Deferred (documented, not yet built):** HttpOnly-cookie auth refactor; TOTP MFA; email-based password reset.
+- **Deferred (documented, not yet built):** HttpOnly-cookie auth refactor.
+- **Shipped, previously mislisted as deferred** (corrected 2026-09-19): **TOTP MFA**
+  (`/api/auth/mfa/setup|enable|disable|verify`, 8 backup codes, `test/mfa.test.js`) and
+  **email-based password reset** (`/api/auth/forgot`, `/api/auth/reset`,
+  `test/password-reset.test.js`). Both are covered by the passing 74-test suite.
 
 ---
 

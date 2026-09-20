@@ -9,7 +9,7 @@
 ## Checklist
 - [ ] `npm test` passes locally
 - [ ] `npm run coverage:check` passes (or coverage intentionally adjusted with rationale)
-- [ ] New user input is validated/sanitized server-side and escaped on render (`esc`/`jsq`/`safeHref`)
+- [ ] New user input is validated/sanitized server-side and escaped on render (`esc`/`safeHref`; `jsq` is retired)
 - [ ] Any new endpoint enforces auth + role + tenant ownership (no IDOR)
 - [ ] Any new opportunity-returning endpoint uses `publicOpp()` for non-owners
 - [ ] Security-relevant actions call `appendAudit(...)`

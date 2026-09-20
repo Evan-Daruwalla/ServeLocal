@@ -1,5 +1,11 @@
 # Guardian Consent Flow — Spec
 
+> **Line numbers stripped 2026-09-19.** Every `server.js:NNN` citation in this spec had
+> drifted by roughly 370-400 lines as the file grew above them; the behavioural claims
+> were all still accurate. Route and function names are the durable reference here --
+> do not reintroduce line numbers.
+
+
 > Status: **Implemented.** This is the precondition identified by the
 > `/llm-council` review of the feature brainstorm (see chairman verdict, 2026-07-02): student
 > registration has a 12+ floor but no ceiling, so **minors and 18+ adults both use the site as
@@ -12,7 +18,7 @@
 ## 1. Scope decision
 
 **Correction from the original draft:** ServeLocal's student userbase is not exclusively
-minors — registration only enforces a 12+ floor (`server.js:820-821`), with no ceiling, so
+minors — registration only enforces a 12+ floor (`server.js`), with no ceiling, so
 18+ adults legitimately use the site as students too. Guardian consent must be **age-gated**,
 not blanket-applied.
 
@@ -31,7 +37,7 @@ Org accounts are unaffected.
 
 ## 2. Data model additions
 
-Add to the student user object (`server.js:822-829`):
+Add to the student user object (`server.js`):
 
 ```js
 guardianName: '',              // sstr(...,120); only collected/required if age(dob) < 18 at registration
@@ -57,9 +63,9 @@ nothing to block.
 
 ## 3. Registration change
 
-`POST /api/auth/register/student` (`server.js:810-835`):
+`POST /api/auth/register/student` (`server.js`):
 
-The existing age check (`server.js:820-821`) already computes `age` from `dob` to enforce the
+The existing age check (`server.js`) already computes `age` from `dob` to enforce the
 12+ floor. Reuse that same value to branch:
 
 - **If `age >= 18`:** `guardianConsentStatus:'not_required'`. `guardianName`/`guardianEmail`
@@ -71,7 +77,7 @@ The existing age check (`server.js:820-821`) already computes `age` from `dob` t
   email` (case-insensitive). Set `guardianConsentStatus:'pending'`, generate the one-time token
   (`crypto.randomBytes(32).toString('hex')`), store only its hash + a
   `CONSENT_TOKEN_TTL_HOURS` (default 72h) expiry, and call `sendEmail()` (already implemented,
-  unused, in `server.js:598-625` via Resend) to `guardianEmail` with a link to
+  unused, in `server.js` via Resend) to `guardianEmail` with a link to
   `${PUBLIC_BASE_URL}/#consent/<token>`.
   `appendAudit(u.id, 'account.guardian_consent_requested', u.id, {guardianEmail})`.
 
@@ -121,11 +127,11 @@ original brainstorm response.
 
 ### `POST /api/account/consent/resend` — authenticated (student)
 Regenerates the one-time token (invalidating the old one) and resends. Cooldown: reuse the
-login-throttle pattern (`server.js:587-591`) keyed on user id, e.g. 1 resend per 5 minutes, to
+login-throttle pattern (`server.js`) keyed on user id, e.g. 1 resend per 5 minutes, to
 stop notification spam toward the guardian.
 
 ### `GET /api/admin/consent/pending` — admin only
-Mirrors the existing `/api/admin/orgs/pending` pattern (`server.js:1758`). Lists students whose
+Mirrors the existing `/api/admin/orgs/pending` pattern (`server.js`). Lists students whose
 `guardianConsentStatus` has been `pending` for longer than N days, so stuck signups are visible
 the same way stuck org applications already are. Gives admin a support queue instead of a black
 hole.
@@ -150,16 +156,16 @@ function requireGuardianConsent(user) {
 Call it at the top of every handler that creates real-world contact with an org, returning 403
 with the helper's payload if non-null:
 
-- **`POST /api/opportunities/:id/apply`** (`server.js:1185`) — the actual commitment to show up
+- **`POST /api/opportunities/:id/apply`** (`server.js`) — the actual commitment to show up
   in person. This is the primary gate: applications can never reach `approved` for an
-  unconsented student, which transitively blocks messaging (`server.js:1598-1642`, already
-  keyed on `status==='approved'`) and check-in redemption (`server.js:2276`, already requires
+  unconsented student, which transitively blocks messaging (`server.js`, already
+  keyed on `status==='approved'`) and check-in redemption (`server.js`, already requires
   an approved application) without touching either of those handlers directly.
-- **`POST /api/messages/:oppId`** (`server.js:1612`) — add explicitly anyway, as defense in
+- **`POST /api/messages/:oppId`** (`server.js`) — add explicitly anyway, as defense in
   depth, not because the apply-gate leaves a gap today. Cheap insurance against a future change
   loosening the approved-application requirement.
-- **`POST /api/checkin`** (`server.js:2276`) — same defense-in-depth reasoning.
-- **`POST /api/endorsements`** (`server.js:1958`) — an org endorsing a student is another
+- **`POST /api/checkin`** (`server.js`) — same defense-in-depth reasoning.
+- **`POST /api/endorsements`** (`server.js`) — an org endorsing a student is another
   adult↔minor record; gate it too.
 
 **Explicitly NOT gated:** browsing/searching opportunities, profile editing, saved searches,

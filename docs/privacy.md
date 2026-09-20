@@ -18,7 +18,7 @@ collect the minimum needed, expose the minimum possible, and let users export or
 | School, grade, location | Matching & school leaderboard | Optional; user-editable |
 | Skills, causes | Recommendations & endorsements | User-editable |
 | Hours / applications / reviews | Core product records | Owned by the user; included in data export |
-| Password | Authentication | Stored only as a salted HMAC-SHA-256 hash; never logged or exported |
+| Password | Authentication | Stored only as a salted **scrypt** hash (OWASP-recommended slow KDF, ADR-0009); legacy HMAC-SHA-256 hashes auto-upgrade to scrypt on next login. Never logged or exported. (Corrected 2026-09-19: this row said HMAC-SHA-256, which described only the legacy fallback.) |
 
 ## How data is exposed
 - **Public/student endpoints** never include org-internal fields — `publicOpp()` strips

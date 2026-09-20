@@ -1,5 +1,7 @@
-Contact: mailto:security@servelocal.org
+Contact: https://github.com/Evan-Daruwalla/ServeLocal/security/advisories/new
 Expires: 2027-06-18T00:00:00.000Z
 Preferred-Languages: en
-Policy: https://servelocal.org/SECURITY.md
+Policy: https://github.com/Evan-Daruwalla/ServeLocal/blob/master/SECURITY.md
 # Please report security issues responsibly. See SECURITY.md for scope and process.
+# Updated 2026-09-19: the previous mailto: and Policy URL both pointed at
+# servelocal.org, which has no MX record and does not answer on 80/443.
