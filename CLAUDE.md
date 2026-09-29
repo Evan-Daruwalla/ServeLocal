@@ -233,3 +233,7 @@ how understanding evolved), not application/logistics tracking.
   read months later when "yesterday" is meaningless.
 
 **Current files:** record = `docs/record_2026-07-02.md` · latest state = `docs/state_2026-07-05.md`.
+
+Never include "Co-Authored-By: Claude Opus 5.5 (or any other model) <noreply@anthropic.com>" in any commits or pushes
+
+Long tasks on Opus 5.5 follow the plan-split rule in the workspace-root CLAUDE.md (Opus plans and reasons; up to 3 Sonnet 5.5 agents run the code part; not for scheduled runs).
