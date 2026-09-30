@@ -1,3 +1,7 @@
+FROZEN - DO NOT DEPLOY (2026-09-29). v1 is kept only as the behavioral reference
+for the v2 rewrite. It is not maintained, and this guide is historical: do not use
+it to put this code into production.
+
 ================================================================================
   SERVELOCAL — DEPLOYMENT GUIDE
 ================================================================================

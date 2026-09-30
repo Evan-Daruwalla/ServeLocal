@@ -1,5 +1,9 @@
 # ServeLocal
 
+> **FROZEN - do not deploy (2026-09-29).** This is v1, kept only as the behavioral
+> reference for the v2 rewrite of Citoya (formerly ServeLocal). It is not maintained
+> or deployed, and `DEPLOY.txt` is historical, not a guide to follow.
+
 Volunteer platform connecting students with community service opportunities.
 Free forever for students; orgs can upgrade to a paid Pro plan for unlimited
 listings, featured placement, and analytics.

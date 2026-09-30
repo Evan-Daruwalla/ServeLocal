@@ -449,6 +449,9 @@ function seedDB() {
     passwordHash: hashPasswordScrypt(ADMIN_PASSWORD, adminSalt), salt: adminSalt,
     name: 'ServeLocal Admin', createdAt: iso()
   });
+  // Audit DN (2026-09-29): production gets the admin account only. The demo accounts below
+  // share a password printed in this public source, and one of them is an approved org.
+  if (IS_PROD) { saveDB(); return; }
 
   // Demo student
   const sSalt = crypto.randomBytes(16).toString('hex');
@@ -1865,11 +1868,16 @@ async function router(req, res) {
   const hoursVerify = p.match(/^\/api\/hours\/([^/]+)\/verify$/);
   if (method==='PATCH' && hoursVerify) {
     if (!user||user.role!=='org') return json(res,{error:'Unauthorized'},401);
+    if (!user.adminApproved) return json(res,{error:'Your organization is pending admin review. You cannot verify hours yet.'},403);
     const idx = DB.hours.findIndex(h=>h.id===hoursVerify[1]);
     if (idx===-1) return json(res,{error:'Not found'},404);
     const orgOppIds = idxList(IDX().oppsByOrg,user.orgId).map(o=>o.id);
-    if (DB.hours[idx].oppId && !orgOppIds.includes(DB.hours[idx].oppId))
-      return json(res,{error:'Forbidden'},403);
+    const h = DB.hours[idx];
+    // Audit DN (2026-09-29): the old `oppId && ...` guard was skipped for a null oppId, so any
+    // org -- even an unapproved one -- could verify a student's SELF-REPORTED hours. Only an
+    // approved org, only its own listing's hours, only while pending.
+    if (!h.oppId || !orgOppIds.includes(h.oppId)) return json(res,{error:'Forbidden'},403);
+    if (h.status !== 'pending') return json(res,{error:'Only pending hours can be verified or denied.'},409);
     const {action,supervisorName,note} = body;
     if (action==='approve') {
       DB.hours[idx].status = 'verified';
@@ -2763,6 +2771,7 @@ async function router(req, res) {
   // PATCH /api/hours/bulk-verify  (org verifies all pending entries at once)
   if (method==='PATCH' && p==='/api/hours/bulk-verify') {
     if (!user||user.role!=='org') return json(res,{error:'Unauthorized'},401);
+    if (!user.adminApproved) return json(res,{error:'Your organization is pending admin review. You cannot verify hours yet.'},403);
     const orgOppIds = idxList(IDX().oppsByOrg,user.orgId).map(o=>o.id);
     const pending = DB.hours.filter(h=>h.status==='pending'&&h.oppId&&orgOppIds.includes(h.oppId));
     pending.forEach(h=>{
